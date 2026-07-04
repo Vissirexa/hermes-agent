@@ -1222,6 +1222,38 @@ Unlike Discord (where reactions are additive), Telegram's Bot API replaces all b
 If the bot doesn't have permission to add reactions in a group, the reaction calls fail silently and message processing continues normally.
 :::
 
+## Reaction Commands
+
+Map emoji reactions *you* place on messages to deterministic actions. Reacting to a message the bot sent (or any message in the chat) triggers the mapped action directly — no model round-trip for control actions, and the action is anchored to the specific message you reacted to.
+
+Disabled by default. Enable in `config.yaml`:
+
+```yaml
+telegram:
+  reaction_commands:
+    enabled: true
+    map:
+      "👎": { action: command, command: "/stop" }
+      "👍": { action: prompt,  prompt: "Approved — proceed with what this message proposes." }
+```
+
+Or via `TELEGRAM_REACTION_COMMANDS=true` (uses the default map: 👎 → `/stop`).
+
+Two action kinds:
+
+- **`command`** — dispatches the command exactly as if you had typed it. `/stop` rides the gateway's early intercept, so it interrupts a running agent mid-generation with zero tokens.
+- **`prompt`** — injects the prompt as a user turn anchored to the reacted message (`reply_to` context carries the message content when it can be resolved), so 👍 on a specific "should I proceed?" message unambiguously approves *that* proposal.
+
+Unmapped emoji are ignored. Reactions from bots or anonymous (channel-identity) reactors are always dropped, and the same user allowlists that gate messages gate reactions.
+
+:::warning
+Telegram only allows reactions from its fixed standard emoji set for non-premium users — 🛑, for example, is **not** a valid reaction emoji, which is why the default stop mapping is 👎. Premium custom-emoji reactions arrive as opaque IDs and are treated as unmapped.
+:::
+
+:::note
+In group chats, Telegram only delivers reaction updates if the bot is an **administrator** of the group. Private 1:1 chats deliver them normally. Note also that the bot's own lifecycle feedback (previous section) uses 👍/👎 on *your* messages — that is unrelated to what your reactions trigger.
+:::
+
 ## Per-Channel Prompts
 
 Assign ephemeral system prompts to specific Telegram groups or forum topics. The prompt is injected at runtime on every turn — never persisted to transcript history — so changes take effect immediately.

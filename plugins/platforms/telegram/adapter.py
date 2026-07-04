@@ -34,6 +34,10 @@ try:
         ContextTypes,
         filters,
     )
+    try:
+        from telegram.ext import MessageReactionHandler
+    except ImportError:
+        MessageReactionHandler = None
     from telegram.constants import ParseMode, ChatType
     from telegram.request import HTTPXRequest
     TELEGRAM_AVAILABLE = True
@@ -48,6 +52,7 @@ except ImportError:
     Application = Any
     CommandHandler = Any
     CallbackQueryHandler = Any
+    MessageReactionHandler = None
     TelegramMessageHandler = Any
     HTTPXRequest = Any
     filters = None
@@ -122,6 +127,7 @@ def check_telegram_requirements() -> bool:
     global InlineKeyboardMarkup, LinkPreviewOptions, Application
     global CommandHandler, CallbackQueryHandler, TelegramMessageHandler
     global ContextTypes, filters, ParseMode, ChatType, HTTPXRequest
+    global MessageReactionHandler
     if TELEGRAM_AVAILABLE:
         return True
     try:
@@ -142,6 +148,10 @@ def check_telegram_requirements() -> bool:
             MessageHandler as _MH,
             ContextTypes as _CT, filters as _filters,
         )
+        try:
+            from telegram.ext import MessageReactionHandler as _MRH
+        except ImportError:
+            _MRH = None
         from telegram.constants import ParseMode as _PM, ChatType as _CtT
         from telegram.request import HTTPXRequest as _HR
     except ImportError:
@@ -155,6 +165,7 @@ def check_telegram_requirements() -> bool:
     Application = _App
     CommandHandler = _CH
     CallbackQueryHandler = _CQH
+    MessageReactionHandler = _MRH
     TelegramMessageHandler = _MH
     ContextTypes = _CT
     filters = _filters
@@ -2909,6 +2920,13 @@ class TelegramAdapter(BasePlatformAdapter):
             ))
             # Handle inline keyboard button callbacks (update prompts)
             self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+            # Handle emoji reactions on existing messages (reaction commands).
+            # Registered unconditionally so config reloads can flip the
+            # feature without a reconnect; the handler no-ops when disabled.
+            if MessageReactionHandler is not None:
+                self._app.add_handler(
+                    MessageReactionHandler(self._handle_message_reaction)
+                )
             
             # Start polling — retry initialize() for transient TLS resets.
             # Each attempt is capped by _init_timeout so a single unreachable
@@ -8150,6 +8168,202 @@ class TelegramAdapter(BasePlatformAdapter):
                 "\U0001f44d" if outcome == ProcessingOutcome.SUCCESS else "\U0001f44e",
             )
 
+    # ── Incoming reaction commands (user reacts to an existing message) ───
+    #
+    # Maps emoji reactions placed by the user on any message in the chat to
+    # deterministic actions, bypassing the model entirely:
+    #   action: command → a synthetic COMMAND event (e.g. "/stop") that rides
+    #     the gateway's early intercept, so it works mid-run with zero tokens.
+    #   action: prompt  → a synthetic TEXT turn anchored to the reacted
+    #     message via reply_to_message_id/reply_to_text.
+    # Configured via config.extra["reaction_commands"]; disabled by default.
+    # Note: Telegram only permits reactions from its fixed standard emoji set
+    # for non-premium users (🛑 is NOT in it); premium custom-emoji reactions
+    # arrive as ReactionTypeCustomEmoji and are treated as unmapped.
+
+    _DEFAULT_REACTION_COMMAND_MAP = {
+        "\U0001f44e": {"action": "command", "command": "/stop"},  # 👎
+    }
+
+    @staticmethod
+    def _normalize_reaction_emoji(emoji: str) -> str:
+        """Strip variation selectors so config keys like ❤️ match Telegram's ❤."""
+        return str(emoji).replace("\ufe0f", "").strip()
+
+    def _reaction_commands_config(self) -> Dict[str, Any]:
+        """Resolve the reaction-command config from config.extra + env.
+
+        Returns ``{"enabled": bool, "map": {normalized_emoji: entry}}`` where
+        each entry is ``{"action": "command", "command": ...}`` or
+        ``{"action": "prompt", "prompt": ...}``. Malformed entries are dropped.
+        ``TELEGRAM_REACTION_COMMANDS`` env overrides the enabled flag.
+        """
+        raw = self.config.extra.get("reaction_commands")
+        raw = raw if isinstance(raw, dict) else {}
+        enabled = str(raw.get("enabled", "")).strip().lower() in {"true", "1", "yes"}
+        env = os.getenv("TELEGRAM_REACTION_COMMANDS")
+        if env is not None and env.strip():
+            enabled = env.strip().lower() not in {"false", "0", "no"}
+        raw_map = raw.get("map")
+        if not isinstance(raw_map, dict) or not raw_map:
+            raw_map = self._DEFAULT_REACTION_COMMAND_MAP
+        emoji_map: Dict[str, Dict[str, str]] = {}
+        for emoji, entry in raw_map.items():
+            if not isinstance(entry, dict):
+                continue
+            action = str(entry.get("action", "")).strip().lower()
+            if action == "command" and str(entry.get("command", "")).strip():
+                emoji_map[self._normalize_reaction_emoji(emoji)] = {
+                    "action": "command",
+                    "command": str(entry["command"]).strip(),
+                }
+            elif action == "prompt" and str(entry.get("prompt", "")).strip():
+                emoji_map[self._normalize_reaction_emoji(emoji)] = {
+                    "action": "prompt",
+                    "prompt": str(entry["prompt"]).strip(),
+                }
+        return {"enabled": enabled, "map": emoji_map}
+
+    @staticmethod
+    def _added_reaction_emojis(mr: Any) -> List[str]:
+        """Emojis newly added in this update (standard emoji only).
+
+        Removals and premium custom-emoji reactions (which carry an opaque
+        custom_emoji_id rather than a character) are excluded.
+        """
+        def _emojis(reactions: Any) -> set:
+            out = set()
+            for r in reactions or ():
+                emoji = getattr(r, "emoji", None)
+                if emoji:
+                    out.add(str(emoji))
+            return out
+
+        return sorted(
+            _emojis(getattr(mr, "new_reaction", None))
+            - _emojis(getattr(mr, "old_reaction", None))
+        )
+
+    async def _handle_message_reaction(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle a message_reaction update: map added emoji to actions."""
+        mr = getattr(update, "message_reaction", None)
+        if mr is None:
+            return
+        cfg = self._reaction_commands_config()
+        if not cfg["enabled"]:
+            return
+        user = getattr(mr, "user", None)
+        # Fail closed: anonymous reactors (actor_chat) and bots carry no
+        # authorizable user identity — never let them trigger actions.
+        if user is None or getattr(user, "is_bot", False):
+            return
+        from types import SimpleNamespace
+        auth_shim = SimpleNamespace(from_user=user, chat=getattr(mr, "chat", None))
+        if not self._is_user_authorized_from_message(auth_shim):
+            logger.warning(
+                "[Telegram] Blocked reaction from unauthorized user %s in chat %s",
+                getattr(user, "id", None),
+                getattr(getattr(mr, "chat", None), "id", None),
+            )
+            return
+        for emoji in self._added_reaction_emojis(mr):
+            entry = cfg["map"].get(self._normalize_reaction_emoji(emoji))
+            if not entry:
+                logger.debug(
+                    "[%s] Unmapped reaction %r on message %s — ignoring",
+                    self.name, emoji, getattr(mr, "message_id", None),
+                )
+                continue
+            await self._dispatch_reaction_action(
+                mr, emoji, entry, update_id=update.update_id
+            )
+
+    def _reaction_message_event(
+        self,
+        mr: Any,
+        text: str,
+        msg_type: MessageType,
+        update_id: Optional[int] = None,
+    ) -> MessageEvent:
+        """Build a synthetic MessageEvent from a MessageReactionUpdated.
+
+        The event anchors to the reacted message: message_id and
+        reply_to_message_id both point at it, and reply_to_text is resolved
+        from the send-time index when available so prompt actions carry the
+        content the user reacted to.
+        """
+        chat = getattr(mr, "chat", None)
+        user = getattr(mr, "user", None)
+        telegram_chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower()
+        chat_type = "dm"
+        if telegram_chat_type in {"group", "supergroup"}:
+            chat_type = "group"
+        elif telegram_chat_type == "channel":
+            chat_type = "channel"
+        chat_id = str(getattr(chat, "id", ""))
+        message_id = str(getattr(mr, "message_id", ""))
+        reply_to_text = None
+        try:
+            from gateway import rich_sent_store
+            reply_to_text = rich_sent_store.lookup(chat_id, message_id)
+        except Exception:
+            reply_to_text = None
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name=(
+                getattr(chat, "title", None)
+                or (getattr(chat, "full_name", None) if chat_type == "dm" else None)
+            ),
+            chat_type=chat_type,
+            user_id=str(getattr(user, "id", "")) or None,
+            user_name=getattr(user, "full_name", None),
+            message_id=message_id,
+            is_bot=False,
+        )
+        return MessageEvent(
+            text=text,
+            message_type=msg_type,
+            source=source,
+            raw_message=mr,
+            message_id=message_id,
+            platform_update_id=update_id,
+            reply_to_message_id=message_id,
+            reply_to_text=reply_to_text,
+            timestamp=getattr(mr, "date", None),
+        )
+
+    async def _dispatch_reaction_action(
+        self,
+        mr: Any,
+        emoji: str,
+        entry: Dict[str, str],
+        update_id: Optional[int] = None,
+    ) -> None:
+        """Dispatch one mapped reaction as a command or an anchored prompt."""
+        if entry["action"] == "command":
+            event = self._reaction_message_event(
+                mr, entry["command"], MessageType.COMMAND, update_id=update_id
+            )
+            logger.info(
+                "[%s] Reaction %s on message %s → command %s",
+                self.name, emoji, getattr(mr, "message_id", None), entry["command"],
+            )
+        else:
+            text = (
+                f"[User reacted with {emoji} to message "
+                f"{getattr(mr, 'message_id', None)}] {entry['prompt']}"
+            )
+            event = self._reaction_message_event(
+                mr, text, MessageType.TEXT, update_id=update_id
+            )
+            logger.info(
+                "[%s] Reaction %s on message %s → prompt turn",
+                self.name, emoji, getattr(mr, "message_id", None),
+            )
+        await self.handle_message(event)
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Plugin migration glue (#41112 / #3823)
@@ -8277,6 +8491,9 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
 
     if "disable_topic_auto_rename" in telegram_cfg:
         extras.setdefault("disable_topic_auto_rename", telegram_cfg["disable_topic_auto_rename"])
+
+    if "reaction_commands" in telegram_cfg:
+        extras.setdefault("reaction_commands", telegram_cfg["reaction_commands"])
 
     _effective_rm = telegram_cfg.get("require_mention", yaml_cfg.get("require_mention"))
     if _effective_rm is not None and not os.getenv("TELEGRAM_REQUIRE_MENTION"):
