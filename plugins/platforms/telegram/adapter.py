@@ -8253,6 +8253,14 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         cfg = self._reaction_commands_config()
         if not cfg["enabled"]:
+            # Log at INFO: user reactions are rare, and a silent drop here is
+            # indistinguishable from the update never arriving (a config-file/
+            # profile mixup looks identical to a Telegram delivery gap).
+            logger.info(
+                "[%s] Reaction update received on message %s but reaction "
+                "commands are disabled — ignoring",
+                self.name, getattr(mr, "message_id", None),
+            )
             return
         user = getattr(mr, "user", None)
         # Fail closed: anonymous reactors (actor_chat) and bots carry no
