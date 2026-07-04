@@ -1254,6 +1254,10 @@ Telegram only allows reactions from its fixed standard emoji set for non-premium
 In group chats, Telegram only delivers reaction updates if the bot is an **administrator** of the group. Private 1:1 chats deliver them normally. Note also that the bot's own lifecycle feedback (previous section) uses 👍/👎 on *your* messages — that is unrelated to what your reactions trigger.
 :::
 
+:::tip
+**React to a stable message.** A reaction tapped on a message that is actively streaming (being edited every second) can race the edit and never commit — the emoji appears briefly, then vanishes, and Telegram never delivers the update to the bot. Streamed drafts can also be deleted and replaced on finalization, taking reactions with them. For mid-run stops, react to your **own last message** (it is never edited) or any older bot message; if your reaction visibly disappears, it didn't register — tap it again on a stable message.
+:::
+
 ## Per-Channel Prompts
 
 Assign ephemeral system prompts to specific Telegram groups or forum topics. The prompt is injected at runtime on every turn — never persisted to transcript history — so changes take effect immediately.
