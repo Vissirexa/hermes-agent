@@ -226,6 +226,7 @@ def build_turn_context(
     _reset_consol = getattr(agent._memory_store, "reset_consolidation_failures", None)
     if callable(_reset_consol):
         _reset_consol()
+    agent._pending_narration_warning = None
     agent._vision_supported = True
 
     # Pre-turn connection health check: clean up dead TCP connections.

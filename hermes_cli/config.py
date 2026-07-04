@@ -978,6 +978,11 @@ DEFAULT_CONFIG = {
         # compounds over a long conversation.  Costs ~70 tokens in the cached
         # system prompt.  Set False to disable globally.
         "parallel_tool_call_guidance": True,
+        # Convergence gate — short prompt block applied to all models that
+        # prevents the model from re-deriving the same analysis instead of
+        # advancing to the next concrete action on long tasks.  Costs ~150
+        # tokens in the cached system prompt.  Set False to disable globally.
+        "convergence_guidance": True,
         # Local-environment toolchain probe — surfaces Python/pip/uv/PEP-668
         # state in the system prompt when something non-default is detected
         # (e.g. python3 has no pip module, pip→python version mismatch, PEP

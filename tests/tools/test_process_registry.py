@@ -140,6 +140,36 @@ class TestGetAndPoll:
         assert result["status"] == "exited"
         assert result["exit_code"] == 0
 
+    def test_poll_rapid_fire_gets_pacing_note(self, registry):
+        """Gap-analysis fix #5: 3+ back-to-back polls of a still-running
+        process append a pacing note (28 identical polls observed in
+        session 20260628_150254). Spaced polls never trigger it."""
+        s = _make_session(output="working")
+        registry._running[s.id] = s
+        first = registry.poll(s.id)
+        second = registry.poll(s.id)
+        third = registry.poll(s.id)
+        assert "pacing_note" not in first
+        assert "pacing_note" not in second
+        assert "polled this still-running process 3 times" in third["pacing_note"]
+
+    def test_poll_spaced_polls_have_no_pacing_note(self, registry):
+        s = _make_session(output="working")
+        registry._running[s.id] = s
+        for _ in range(4):
+            result = registry.poll(s.id)
+            assert "pacing_note" not in result
+            # Simulate a well-spaced poll cadence without sleeping.
+            last_ts, count = registry._poll_pacing[s.id]
+            registry._poll_pacing[s.id] = (last_ts - 31.0, count)
+
+    def test_poll_pacing_state_cleared_on_exit(self, registry):
+        s = _make_session(exited=True, exit_code=0, output="done")
+        registry._finished[s.id] = s
+        registry._poll_pacing[s.id] = (time.time(), 5)
+        registry.poll(s.id)
+        assert s.id not in registry._poll_pacing
+
 
 def test_request_close_terminal_without_sink_is_desktop_only_error(registry):
     """No UI close sink wired (CLI/messaging) → clear desktop-only error, no raise."""

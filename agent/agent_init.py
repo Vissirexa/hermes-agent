@@ -449,6 +449,7 @@ def init_agent(
     agent._executing_tools = False
     agent._tool_guardrails = ToolCallGuardrailController()
     agent._tool_guardrail_halt_decision: ToolGuardrailDecision | None = None
+    agent._pending_narration_warning: ToolGuardrailDecision | None = None
 
     # Interrupt mechanism for breaking out of tool loops
     agent._interrupt_requested = False
@@ -1357,6 +1358,12 @@ def init_agent(
     # the other.  Steers the model to batch independent tool calls into a
     # single turn; the runtime already executes such batches concurrently.
     agent._parallel_tool_call_guidance = bool(_agent_section.get("parallel_tool_call_guidance", True))
+
+    # Convergence gate toggle.  Default True.  Prevents the model from
+    # re-deriving the same analysis instead of advancing to the next concrete
+    # action on long tasks.  Separate from task_completion_guidance because
+    # it targets a different failure mode (analysis loops vs. premature stop).
+    agent._convergence_guidance = bool(_agent_section.get("convergence_guidance", True))
 
     # Local Python toolchain probe toggle.  Default True.  When False,
     # the probe is skipped entirely (no subprocess calls, no system-prompt

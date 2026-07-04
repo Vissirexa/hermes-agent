@@ -328,6 +328,72 @@ TASK_COMPLETION_GUIDANCE = (
     "is always better than inventing a result."
 )
 
+# Convergence gate — prevents the model from re-deriving the same analysis
+# instead of advancing to the next concrete action on long tasks.
+# Addresses: re-summarizing findings ~5× without advancing (88c28d97),
+# blindly replaying a whole prior session after a failed compaction (3ac6e5/08c59f).
+# Applied to ALL models; short because it lives in the cached system prompt.
+CONVERGENCE_GUIDANCE = (
+    "# Convergence gate\\n"
+    "When working on a multi-step task, after each tool result ask yourself:\\n"
+    "  1. What have I established so far? (list facts, not plans)\\n"
+    "  2. What is the NEXT concrete action that advances the task?\\n"
+    "If you find yourself re-analyzing, re-summarizing, or re-deriving the same\\n"
+    "conclusion, STOP and take the next concrete action instead. Do not re-explain\\n"
+    "what you already know — use it to move forward.\\n"
+    "If a tool call failed, state the failure, try a different approach, and\\n"
+    "advance. Never replay an entire prior session or re-read the same data\\n"
+    "multiple times without a new hypothesis.\\n"
+    "On long tasks: surface compaction loss explicitly if context was lost,\\n"
+    "then resume from the last known good state."
+)
+
+# Web-fetch steer — addresses the bot-block loop: the model hand-rolled raw
+# HTTP requests in execute_code (no browser fingerprint) against Cloudflare-
+# protected sites, got 403/404/challenge pages, and looped (e.g. levels.fyi).
+# Real browsers and the web tools carry a legitimate fingerprint; raw requests
+# do not. Kept short — lives in the cached system prompt.
+WEB_FETCH_GUIDANCE = (
+    "# Fetching web pages\n"
+    "To read a single web page, use the fetch_resilient tool (when available) "
+    "or web_extract — not hand-written HTTP requests in execute_code or "
+    "terminal. Raw requests (python requests, curl) send a non-browser "
+    "fingerprint and get flagged as a bot — that is why such fetches return "
+    "403/429/CAPTCHA/Cloudflare or soft 404 pages. fetch_resilient mimics a "
+    "real browser (Chrome TLS fingerprint, then a real browser if needed) and "
+    "handles most of that for you. If a fetch comes back blocked=true, do NOT "
+    "retry the same URL or loop variations of it: switch to a different source "
+    "— prefer official APIs or public datasets meant to be read — and if none "
+    "work, report the blocker to the user with whatever you did obtain."
+)
+
+# Variant injected when NO dedicated web-fetch tool is registered in the
+# session. The full steer names fetch_resilient/web_extract; naming tools that
+# aren't loaded actively induces hallucinated tool calls — session
+# 20260701_121806 called the nonexistent web_extract/web 7 times, then fell
+# back to a ~30-call raw-curl thrash. When the tools are absent the steer must
+# say so and pre-empt both failure modes.
+WEB_FETCH_GUIDANCE_NO_FETCH_TOOLS = (
+    "# Fetching web pages\n"
+    "No dedicated web-fetch tools (fetch_resilient, web_extract, web_search) "
+    "are loaded in this session — do NOT attempt to call them; the calls will "
+    "fail. A simple curl/requests fetch of an openly accessible page is fine, "
+    "but be aware raw HTTP sends a non-browser fingerprint: protected or "
+    "JS-rendered sites will return 403/429/CAPTCHA/Cloudflare or soft-404 "
+    "pages. If that happens, do NOT retry the URL or loop variations of it — "
+    "switch to a source meant to be read programmatically (official APIs, "
+    "public datasets), and if none work, report the blocker to the user and "
+    "note that enabling the web toolset / a web backend would unblock it."
+)
+
+
+def build_web_fetch_guidance(valid_tool_names) -> str:
+    """Return the web-fetch steer matching the tools actually registered."""
+    names = set(valid_tool_names or ())
+    if names & {"fetch_resilient", "web_extract"}:
+        return WEB_FETCH_GUIDANCE
+    return WEB_FETCH_GUIDANCE_NO_FETCH_TOOLS
+
 # Universal parallel-tool-call guidance — applied to ALL models.
 #
 # Why this matters for cost: every assistant turn resends the entire

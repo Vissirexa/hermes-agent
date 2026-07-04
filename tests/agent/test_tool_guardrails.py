@@ -256,3 +256,142 @@ def test_reset_for_turn_clears_bounded_guardrail_state():
 
     assert controller.before_call("web_search", {"query": "same"}).action == "allow"
     assert controller.before_call("read_file", {"path": "/tmp/x"}).action == "allow"
+
+
+def test_repeated_identical_result_halts_successful_varying_arg_loop():
+    """The real-world loop: execute_code 'succeeds' with different args every
+    call but returns the same blocked/404 body. Failure- and signature-keyed
+    counters miss it; result-repetition detection must catch it."""
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            repeated_result_warn_after=3,
+            repeated_result_halt_after=5,
+        )
+    )
+    blocked_body = (
+        '{"status": "success", "output": "=== LEVELS.FYI COMPENSATION API ==='
+        + "<!DOCTYPE html>" + "x" * 300 + '"}'
+    )
+
+    decisions = []
+    for i in range(5):
+        # Different arguments every call, never classified as a failure.
+        decisions.append(
+            controller.after_call(
+                "execute_code", {"code": f"fetch_attempt_{i}()"}, blocked_body, failed=False
+            )
+        )
+
+    assert decisions[2].action == "warn"
+    assert decisions[2].code == "repeated_result_warning"
+    assert decisions[4].action == "halt"
+    assert decisions[4].code == "repeated_result_halt"
+    assert controller.halt_decision is decisions[4]
+
+
+def test_repeated_result_ignores_short_and_distinct_outputs():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, repeated_result_halt_after=3)
+    )
+    # Short identical results must not trip the guard.
+    for _ in range(5):
+        d = controller.after_call("execute_code", {"code": "x"}, '{"ok":true}', failed=False)
+        assert d.action == "allow"
+    # Long but genuinely distinct results = real progress, never halts.
+    for i in range(5):
+        body = '{"status":"success","output":"' + f"unique-{i}-" + "y" * 300 + '"}'
+        d = controller.after_call("execute_code", {"code": f"c{i}"}, body, failed=False)
+        assert d.action == "allow"
+    assert controller.halt_decision is None
+
+
+def test_observe_assistant_message_warns_then_halts_on_repeated_narration():
+    """The model restating the same sentence every turn (different tools/results)
+    must warn, then halt, even though no single tool call repeats."""
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            assistant_repeat_warn_after=2,
+            assistant_repeat_halt_after=3,
+        )
+    )
+    line = "I'm hitting the same wall with levels.fyi. Let me try alternative salary sources."
+
+    first = controller.observe_assistant_message(line)
+    second = controller.observe_assistant_message("  I'M HITTING the same WALL with levels.fyi.   Let me try alternative salary sources.  ")
+    third = controller.observe_assistant_message(line)
+
+    assert first is None
+    assert second.action == "warn" and second.code == "assistant_repeat_warning"
+    assert third.action == "halt" and third.code == "assistant_repeat_halt"
+    assert controller.halt_decision is third
+
+
+def test_observe_assistant_message_ignores_short_and_distinct_messages():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, assistant_repeat_halt_after=2)
+    )
+    # Short messages never count.
+    assert controller.observe_assistant_message("ok") is None
+    assert controller.observe_assistant_message("on it") is None
+    # Distinct substantial messages are genuine progress.
+    assert controller.observe_assistant_message("Fetching the compensation table from the first source now.") is None
+    assert controller.observe_assistant_message("That failed, so I am parsing the cached JSON snapshot instead.") is None
+    assert controller.halt_decision is None
+
+
+def _multimodal_vision_result(image_b64: str, question: str = "Describe everything visible.") -> dict:
+    """Shape returned by vision_analyze's native path (see tools/vision_tools.py)."""
+    return {
+        "_multimodal": True,
+        "content": [
+            {
+                "type": "text",
+                "text": (
+                    "Image loaded into your context — you can see it natively now. "
+                    "Use your built-in vision to answer the user."
+                    f"\n\nQuestion: {question}" + " " * 120
+                ),
+            },
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+        ],
+        "text_summary": "Image attached natively for the main model.",
+    }
+
+
+def test_repeated_multimodal_result_same_image_trips_guard():
+    """Session 20260701_121806: identical multimodal placeholders repeated 6x with
+    zero guard activity because str(result) embedded unique base64 payloads.
+    Re-loading the *same* image must count as repetition."""
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            repeated_result_warn_after=3,
+            repeated_result_halt_after=5,
+        )
+    )
+    same = _multimodal_vision_result("A" * 4000)
+    decisions = [
+        controller.after_call("vision_analyze", {"image_url": f"/tmp/shot_{i}.png"}, same, failed=False)
+        for i in range(5)
+    ]
+    assert decisions[2].action == "warn"
+    assert decisions[2].code == "repeated_result_warning"
+    assert decisions[4].action == "halt"
+    assert decisions[4].code == "repeated_result_halt"
+
+
+def test_repeated_multimodal_result_distinct_images_is_progress():
+    """Distinct screenshots with an identical text part (scrolling through a long
+    page) are legitimate progress and must NOT halt, even past the threshold."""
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, repeated_result_halt_after=5)
+    )
+    for i in range(8):
+        result = _multimodal_vision_result(f"IMG{i}" * 1000)
+        d = controller.after_call(
+            "vision_analyze", {"image_url": f"/tmp/shot_{i}.png"}, result, failed=False
+        )
+        assert d.action == "allow"
+    assert controller.halt_decision is None

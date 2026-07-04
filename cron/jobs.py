@@ -313,6 +313,111 @@ def parse_duration(s: str) -> int:
     return value * multipliers[unit]
 
 
+# ── Natural-language schedule parsing ────────────────────────────────────────
+# Maps common day-of-week names and time formats to cron-compatible expressions.
+# This lets models emit "sunday at 18:00" instead of "0 18 * * 0" without
+# getting a hard parse error.
+
+_DAY_MAP = {
+    "monday": "1", "tuesday": "2", "wednesday": "3", "thursday": "4",
+    "friday": "5", "saturday": "6", "sunday": "0",
+    "mon": "1", "tue": "2", "wed": "3", "thu": "4", "fri": "5",
+    "sat": "6", "sun": "0",
+}
+
+# 12-hour time helpers
+_AM_PM = {"am": 0, "pm": 1}
+
+
+def _parse_natural_language_schedule(schedule: str, schedule_lower: str) -> Optional[Dict[str, Any]]:
+    """Try to parse a natural-language schedule into a cron expression.
+
+    Returns a dict with kind='cron' on success, or None if the schedule
+    doesn't match any known pattern (caller falls through to the strict parser).
+
+    Supported patterns:
+      - "every <day> at <time>"  → recurring cron (e.g. "every sunday at 18:00")
+      - "<day> at <time>"        → one-shot cron (e.g. "sunday at 18:00")
+      - "every day at <time>"    → daily recurring cron
+      - "every hour at <min>"    → hourly recurring cron (e.g. "every hour at 30")
+    """
+    # Pattern: "every <day> at <time>" or "every day at <time>" or "every hour at <min>"
+    m = re.match(
+        r'^every\s+(?:day|monday|tuesday|wednesday|thursday|friday|saturday|sunday|'
+        r'mon|tue|wed|thu|fri|sat|sun|hour)\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$',
+        schedule_lower,
+    )
+    if m:
+        raw_hour = int(m.group(1))
+        minute = int(m.group(2)) if m.group(2) else 0
+        ampm = m.group(3)
+
+        # Determine day-of-week field
+        day_word = schedule_lower.split()[1] if len(schedule_lower.split()) > 1 else ""
+        if day_word == "hour":
+            # "every hour at 30" → the number is a minute (0-59), not an hour
+            minute = raw_hour if raw_hour < 60 else minute
+            return {
+                "kind": "cron",
+                "expr": f"{minute} * * * *",
+                "display": f"every hour at {minute:02d}",
+            }
+        elif day_word in _DAY_MAP:
+            hour = raw_hour
+            # 12h → 24h conversion
+            if ampm:
+                if ampm == "pm" and hour != 12:
+                    hour += 12
+                elif ampm == "am" and hour == 12:
+                    hour = 0
+            dow = _DAY_MAP[day_word]
+            return {
+                "kind": "cron",
+                "expr": f"{minute} {hour} * * {dow}",
+                "display": f"every {day_word.title()} at {m.group(1)}{'am' if ampm == 'am' else 'pm'}" if ampm else f"every {day_word.title()} at {hour:02d}:{minute:02d}",
+            }
+        else:
+            # "every day at ..."
+            hour = raw_hour
+            if ampm:
+                if ampm == "pm" and hour != 12:
+                    hour += 12
+                elif ampm == "am" and hour == 12:
+                    hour = 0
+            return {
+                "kind": "cron",
+                "expr": f"{minute} {hour} * * *",
+                "display": f"every day at {m.group(1)}{'am' if ampm == 'am' else 'pm'}" if ampm else f"every day at {hour:02d}:{minute:02d}",
+            }
+
+    # Pattern: "<day> at <time>" (one-shot — treat as recurring for safety)
+    m = re.match(
+        r'^(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|'
+        r'mon|tue|wed|thu|fri|sat|sun)\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$',
+        schedule_lower,
+    )
+    if m:
+        hour = int(m.group(1))
+        minute = int(m.group(2)) if m.group(2) else 0
+        ampm = m.group(3)
+        day_word = schedule_lower.split()[0]
+
+        if ampm:
+            if ampm == "pm" and hour != 12:
+                hour += 12
+            elif ampm == "am" and hour == 12:
+                hour = 0
+
+        dow = _DAY_MAP.get(day_word, "*")
+        return {
+            "kind": "cron",
+            "expr": f"{minute} {hour} * * {dow}",
+            "display": f"every {day_word.title()} at {m.group(1)}{'am' if ampm == 'am' else 'pm'}" if ampm else f"every {day_word.title()} at {hour:02d}:{minute:02d}",
+        }
+
+    return None
+
+
 def parse_schedule(schedule: str) -> Dict[str, Any]:
     """
     Parse schedule string into structured format.
@@ -334,6 +439,14 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
     schedule = schedule.strip()
     original = schedule
     schedule_lower = schedule.lower()
+    
+    # ── Natural-language schedule parsing (before strict "every X" check) ──
+    # "every <day> at <time>" and similar patterns must be caught BEFORE the
+    # "every X" duration check, because "every sunday at 18:00" starts with
+    # "every " but "sunday at 18:00" is not a valid duration.
+    nl_result = _parse_natural_language_schedule(schedule, schedule_lower)
+    if nl_result is not None:
+        return nl_result
     
     # "every X" pattern → recurring interval
     if schedule_lower.startswith("every "):
@@ -403,13 +516,14 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
         }
     except ValueError:
         pass
-    
+
     raise ValueError(
         f"Invalid schedule '{original}'. Use:\n"
         f"  - Duration: '30m', '2h', '1d' (one-shot)\n"
         f"  - Interval: 'every 30m', 'every 2h' (recurring)\n"
         f"  - Cron: '0 9 * * *' (cron expression)\n"
-        f"  - Timestamp: '2026-02-03T14:00:00' (one-shot at time)"
+        f"  - Timestamp: '2026-02-03T14:00:00' (one-shot at time)\n"
+        f"  - Natural language: 'sunday at 18:00', 'every day at 9am'"
     )
 
 

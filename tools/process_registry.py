@@ -188,6 +188,14 @@ class ProcessRegistry:
         # consults this set; the gateway/tui watchers deliberately do NOT.
         self._poll_observed: set = set()
 
+        # Impatient-polling tracker (gap-analysis secondary fix #5): the model
+        # polls still-running processes back-to-back (observed 28 identical
+        # polls in session 20260628_150254, ~5x at 1s intervals in e46d34).
+        # poll() consults this to append a pacing note once polling turns
+        # rapid-fire; results otherwise vary (uptime), so the repetition
+        # guards never see it.  session_id -> (last_poll_ts, rapid_count)
+        self._poll_pacing: dict = {}
+
         # Global watch-match circuit breaker — across all sessions.
         # Prevents sibling processes from collectively flooding the user even
         # when each stays under its own per-session cap.
@@ -1287,6 +1295,23 @@ class ProcessRegistry:
             # without affecting the gateway/tui watchers, which only consult
             # _completion_consumed.
             self._poll_observed.add(session_id)
+            self._poll_pacing.pop(session_id, None)
+        else:
+            # Rapid-fire polling of a still-running process wastes turns on a
+            # slow local backend. Count consecutive polls under 30s apart and
+            # nudge the model toward wait()/notify_on_complete once it's clearly
+            # spinning. The counter resets whenever polls are reasonably spaced.
+            now = time.time()
+            last_ts, rapid_count = self._poll_pacing.get(session_id, (0.0, 0))
+            rapid_count = rapid_count + 1 if (now - last_ts) < 30.0 else 1
+            self._poll_pacing[session_id] = (now, rapid_count)
+            if rapid_count >= 3:
+                result["pacing_note"] = (
+                    f"You have polled this still-running process {rapid_count} times in "
+                    "quick succession. Polling faster does not make it finish sooner. "
+                    "Use process(action='wait') to block until it exits, rely on "
+                    "notify_on_complete, or do other useful work and check back later."
+                )
         if session.detached:
             result["detached"] = True
             result["note"] = "Process recovered after restart -- output history unavailable"

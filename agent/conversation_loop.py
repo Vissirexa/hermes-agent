@@ -4186,6 +4186,27 @@ def run_conversation(
                 else:
                     assistant_message.content = str(raw)
 
+            # Narration-loop detection (complementary to result-repetition):
+            # catch the model restating the same message turn after turn even
+            # when its tool calls and results all differ. Halt sets the same
+            # decision the tool guardrail uses, consumed after tool execution
+            # (~line 4233); warn rides the next tool result so the model sees it.
+            try:
+                _narration_decision = agent._tool_guardrails.observe_assistant_message(
+                    assistant_message.content
+                )
+                if _narration_decision is not None:
+                    if _narration_decision.should_halt:
+                        agent._set_tool_guardrail_halt(_narration_decision)
+                        agent._emit_status(
+                            f"⚠️ Tool guardrail: {_narration_decision.code} "
+                            f"(repeated narration ×{_narration_decision.count})"
+                        )
+                    elif _narration_decision.action == "warn":
+                        agent._pending_narration_warning = _narration_decision
+            except Exception:
+                pass
+
             try:
                 from hermes_cli.plugins import (
                     has_hook,

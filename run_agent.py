@@ -5588,6 +5588,12 @@ class AIAgent:
             function_result = append_toolguard_guidance(function_result, decision)
         if decision.should_halt:
             self._set_tool_guardrail_halt(decision)
+        # Surface a pending narration-repetition warning on the next tool result
+        # the model will read, then clear it so it fires once per occurrence.
+        pending = getattr(self, "_pending_narration_warning", None)
+        if pending is not None:
+            function_result = append_toolguard_guidance(function_result, pending)
+            self._pending_narration_warning = None
         return function_result
 
     def _guardrail_block_result(self, decision: ToolGuardrailDecision) -> str:

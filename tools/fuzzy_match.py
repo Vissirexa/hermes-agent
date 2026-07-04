@@ -67,7 +67,10 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
         return content, 0, None, "old_string cannot be empty"
 
     if old_string == new_string:
-        return content, 0, None, "old_string and new_string are identical"
+        return content, 0, None, (
+            "old_string and new_string are identical — no change would be made. "
+            "Re-read the file and provide a different new_string, or skip this patch."
+        )
 
     # Try each matching strategy in order
     strategies: List[Tuple[str, Callable]] = [

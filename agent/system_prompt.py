@@ -40,7 +40,9 @@ from agent.prompt_builder import (
     STEER_CHANNEL_NOTE,
     TASK_COMPLETION_GUIDANCE,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
+    build_web_fetch_guidance,
     TOOL_USE_ENFORCEMENT_MODELS,
+    CONVERGENCE_GUIDANCE,
     drain_truncation_warnings,
 )
 from agent.runtime_cwd import resolve_context_cwd
@@ -172,6 +174,20 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # users who want a leaner prompt can turn it off.
     if getattr(agent, "_task_completion_guidance", True) and agent.valid_tool_names:
         stable_parts.append(TASK_COMPLETION_GUIDANCE)
+
+    # Convergence gate — prevents re-analysis loops on long tasks.  Applied to
+    # ALL models; short because it lives in the cached system prompt.  Gated by
+    # config.yaml ``agent.convergence_guidance`` (default True).
+    if getattr(agent, "_convergence_guidance", True) and agent.valid_tool_names:
+        stable_parts.append(CONVERGENCE_GUIDANCE)
+
+    # Web-fetch steer: use the browser/web tools (real fingerprint) instead of
+    # raw HTTP in execute_code, and switch sources instead of looping when
+    # blocked. Tool-aware: when no fetch tool is registered the variant says so
+    # explicitly — naming unavailable tools induces hallucinated tool calls
+    # (session 20260701_121806).
+    if agent.valid_tool_names:
+        stable_parts.append(build_web_fetch_guidance(agent.valid_tool_names))
 
     # Universal parallel-tool-call guidance.  Tells the model to batch
     # independent tool calls into one assistant turn rather than emitting one
