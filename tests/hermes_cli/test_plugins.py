@@ -357,6 +357,167 @@ class TestPluginDiscovery:
 
 
 
+    def test_execution_middleware_pre_next_call_error_fails_open_to_remaining_chain(self, monkeypatch):
+        calls = []
+
+        def failing_middleware(**kwargs):
+            calls.append("failing")
+            raise RuntimeError("middleware setup failed")
+
+        def downstream_middleware(**kwargs):
+            calls.append("downstream")
+            return kwargs["next_call"]({**kwargs["args"], "rewritten": True})
+
+        manager = types.SimpleNamespace(_middleware={"tool_execution": [failing_middleware, downstream_middleware]})
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+
+        def terminal(args):
+            calls.append(("terminal", args))
+            return args
+
+        result = run_tool_execution_middleware("terminal", {"command": "printf ok"}, terminal)
+
+        assert result == {"command": "printf ok", "rewritten": True}
+        assert calls == ["failing", "downstream", ("terminal", {"command": "printf ok", "rewritten": True})]
+
+    def test_execution_middleware_translated_downstream_failure_is_not_masked(self, monkeypatch):
+        calls = []
+
+        def middleware(**kwargs):
+            try:
+                return kwargs["next_call"](kwargs["args"])
+            except Exception as exc:
+                raise RuntimeError(f"translated downstream failure: {exc}") from exc
+
+        manager = types.SimpleNamespace(_middleware={"tool_execution": [middleware]})
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+
+        def terminal(args):
+            calls.append(args)
+            raise RuntimeError("terminal failed")
+
+        with pytest.raises(RuntimeError, match="translated downstream failure: terminal failed"):
+            run_tool_execution_middleware("terminal", {"command": "false"}, terminal)
+
+        assert calls == [{"command": "false"}]
+
+    def test_execution_middleware_downstream_base_exception_is_not_wrapped(self, monkeypatch):
+        calls = []
+
+        def middleware(**kwargs):
+            try:
+                return kwargs["next_call"](kwargs["args"])
+            except Exception as exc:
+                raise RuntimeError(f"middleware should not catch base exception: {exc}") from exc
+
+        manager = types.SimpleNamespace(_middleware={"tool_execution": [middleware]})
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+
+        def terminal(args):
+            calls.append(args)
+            raise KeyboardInterrupt()
+
+        with pytest.raises(KeyboardInterrupt):
+            run_tool_execution_middleware("terminal", {"command": "interrupt"}, terminal)
+
+        assert calls == [{"command": "interrupt"}]
+
+    def test_execution_middleware_double_next_call_does_not_run_terminal_twice(self, monkeypatch):
+        calls = []
+
+        def middleware(**kwargs):
+            first = kwargs["next_call"](kwargs["args"])
+            # Deliberate misuse: a second next_call() must not re-run the
+            # downstream tool. The chain surfaces it as an error and preserves
+            # the first (successful) downstream result.
+            kwargs["next_call"](kwargs["args"])
+            return first
+
+        manager = types.SimpleNamespace(_middleware={"tool_execution": [middleware]})
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+
+        def terminal(args):
+            calls.append(args)
+            return "terminal-result"
+
+        result = run_tool_execution_middleware("terminal", {"command": "printf ok"}, terminal)
+
+        assert result == "terminal-result"
+        assert calls == [{"command": "printf ok"}]
+
+    def test_request_middleware_tolerates_non_deepcopyable_payload(self, monkeypatch):
+        import threading
+
+        recorded = {}
+
+        def middleware(**kwargs):
+            recorded["args"] = kwargs["args"]
+            return None
+
+        manager = types.SimpleNamespace(
+            _middleware={"tool_request": [middleware]},
+            invoke_middleware=lambda kind, **kwargs: [middleware(**kwargs)],
+        )
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+
+        # threading.Lock is not deepcopyable; a hard deepcopy would raise.
+        args = {"command": "noop", "lock": threading.Lock()}
+        result = apply_tool_request_middleware("terminal", args)
+
+        # Middleware ran (payload was copied via the shallow fallback) and the
+        # non-deepcopyable member is shared by reference rather than aborting.
+        assert recorded["args"]["command"] == "noop"
+        assert result.payload["command"] == "noop"
+        assert result.payload["lock"] is args["lock"]
+
+    def test_discover_project_plugins(self, tmp_path, monkeypatch):
+        """Plugins in ./.hermes/plugins/ are discovered."""
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        monkeypatch.chdir(project_dir)
+        monkeypatch.setenv("HERMES_ENABLE_PROJECT_PLUGINS", "true")
+        plugins_dir = project_dir / ".hermes" / "plugins"
+        _make_plugin_dir(plugins_dir, "proj_plugin")
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert "proj_plugin" in mgr._plugins
+        assert mgr._plugins["proj_plugin"].enabled
+
+    def test_discover_project_plugins_skipped_by_default(self, tmp_path, monkeypatch):
+        """Project plugins are not discovered unless explicitly enabled."""
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        monkeypatch.chdir(project_dir)
+        plugins_dir = project_dir / ".hermes" / "plugins"
+        _make_plugin_dir(plugins_dir, "proj_plugin")
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert "proj_plugin" not in mgr._plugins
+
+    def test_discover_is_idempotent(self, tmp_path, monkeypatch):
+        """Calling discover_and_load() twice does not duplicate plugins."""
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        _make_plugin_dir(plugins_dir, "once_plugin")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+        mgr.discover_and_load()  # second call should no-op
+
+        # Filter to just our fixture's own user-dir plugin. Scoping by
+        # source=="user" (rather than the weaker source!="bundled") also
+        # excludes any real pip entry-point plugins that happen to be
+        # installed in this venv (e.g. a community plugin like rtk-hermes) —
+        # those are process-wide discoveries unrelated to this fixture.
+        non_bundled = {
+            n: p for n, p in mgr._plugins.items()
+            if p.manifest.source == "user"
+        }
+        assert len(non_bundled) == 1
 
     def test_failed_discovery_is_not_cached(self, tmp_path, monkeypatch):
         """A sweep that raises must not cache 'discovered' with no plugins.
@@ -386,13 +547,40 @@ class TestPluginDiscovery:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
         mgr.discover_and_load()
         assert mgr._discovered is True
+        # Scope to source=="user" (our fixture's own plugin dir), not just
+        # !="bundled" — excludes real pip entry-point plugins installed in
+        # this venv (e.g. rtk-hermes), which are process-wide and unrelated
+        # to this fixture.
         non_bundled = {
             n: p for n, p in mgr._plugins.items()
-            if p.manifest.source != "bundled"
+            if p.manifest.source == "user"
         }
         assert len(non_bundled) == 1
 
 
+    def test_entry_points_scanned(self, tmp_path, monkeypatch):
+        """Entry-point based plugins are discovered (mocked)."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        fake_module = types.ModuleType("fake_ep_plugin")
+        fake_module.register = lambda ctx: None  # type: ignore[attr-defined]
+
+        fake_ep = MagicMock()
+        fake_ep.name = "ep_plugin"
+        fake_ep.value = "fake_ep_plugin:register"
+        fake_ep.group = ENTRY_POINTS_GROUP
+        fake_ep.load.return_value = fake_module
+
+        def fake_entry_points():
+            result = MagicMock()
+            result.select = MagicMock(return_value=[fake_ep])
+            return result
+
+        with patch("importlib.metadata.entry_points", fake_entry_points):
+            mgr = PluginManager()
+            mgr.discover_and_load()
+
+        assert "ep_plugin" in mgr._plugins
 
     def test_force_rediscover_clears_all_plugin_registries(self, monkeypatch):
         """force=True must clear every plugin-populated registry.
