@@ -256,3 +256,108 @@ def test_reset_for_turn_clears_bounded_guardrail_state():
 
     assert controller.before_call("web_search", {"query": "same"}).action == "allow"
     assert controller.before_call("read_file", {"path": "/tmp/x"}).action == "allow"
+
+
+def test_repeated_identical_result_halts_successful_varying_arg_loop():
+    """The real-world loop: execute_code 'succeeds' with different args every
+    call but returns the same blocked/404 body. Failure- and signature-keyed
+    counters miss it; result-repetition detection must catch it."""
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            repeated_result_warn_after=3,
+            repeated_result_halt_after=5,
+        )
+    )
+    blocked_body = (
+        '{"status": "success", "output": "=== SOME REMOTE API RESPONSE ==='
+        + "<!DOCTYPE html>" + "x" * 300 + '"}'
+    )
+
+    decisions = []
+    for i in range(5):
+        # Different arguments every call, never classified as a failure.
+        decisions.append(
+            controller.after_call(
+                "execute_code", {"code": f"fetch_attempt_{i}()"}, blocked_body, failed=False
+            )
+        )
+
+    assert decisions[2].action == "warn"
+    assert decisions[2].code == "repeated_result_warning"
+    assert decisions[4].action == "halt"
+    assert decisions[4].code == "repeated_result_halt"
+    assert controller.halt_decision is decisions[4]
+
+
+def test_repeated_result_ignores_short_and_distinct_outputs():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, repeated_result_halt_after=3)
+    )
+    # Short identical results must not trip the guard.
+    for _ in range(5):
+        d = controller.after_call("execute_code", {"code": "x"}, '{"ok":true}', failed=False)
+        assert d.action == "allow"
+    # Long but genuinely distinct results = real progress, never halts.
+    for i in range(5):
+        body = '{"status":"success","output":"' + f"unique-{i}-" + "y" * 300 + '"}'
+        d = controller.after_call("execute_code", {"code": f"c{i}"}, body, failed=False)
+        assert d.action == "allow"
+    assert controller.halt_decision is None
+
+
+def _multimodal_vision_result(image_b64: str, question: str = "Describe everything visible.") -> dict:
+    """Shape returned by a native vision-analysis tool result."""
+    return {
+        "_multimodal": True,
+        "content": [
+            {
+                "type": "text",
+                "text": (
+                    "Image loaded into your context — you can see it natively now. "
+                    "Use your built-in vision to answer the user."
+                    f"\n\nQuestion: {question}" + " " * 120
+                ),
+            },
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+        ],
+        "text_summary": "Image attached natively for the main model.",
+    }
+
+
+def test_repeated_multimodal_result_same_image_trips_guard():
+    """Multimodal results embed base64 image payloads, so a naive str(result)
+    hash is unique per image and identical *text* parts (the placeholder
+    caption) can never be seen as repetition. Re-loading the *same* image
+    repeatedly must still count as repetition."""
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            repeated_result_warn_after=3,
+            repeated_result_halt_after=5,
+        )
+    )
+    same = _multimodal_vision_result("A" * 4000)
+    decisions = [
+        controller.after_call("vision_analyze", {"image_url": f"/tmp/shot_{i}.png"}, same, failed=False)
+        for i in range(5)
+    ]
+    assert decisions[2].action == "warn"
+    assert decisions[2].code == "repeated_result_warning"
+    assert decisions[4].action == "halt"
+    assert decisions[4].code == "repeated_result_halt"
+
+
+def test_repeated_multimodal_result_distinct_images_is_progress():
+    """Distinct screenshots with an identical text part (scrolling through a long
+    page) are legitimate progress and must NOT halt, even past the threshold."""
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, repeated_result_halt_after=5)
+    )
+    for i in range(8):
+        result = _multimodal_vision_result(f"IMG{i}" * 1000)
+        d = controller.after_call(
+            "vision_analyze", {"image_url": f"/tmp/shot_{i}.png"}, result, failed=False
+        )
+        assert d.action == "allow"
+    assert controller.halt_decision is None
