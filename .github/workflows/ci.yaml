@@ -203,6 +203,10 @@ jobs:
     name: OSV scan
     uses: ./.github/workflows/osv-scanner.yml
 
+  lintlang:
+    name: lintlang (agent config/prompt lint)
+    uses: ./.github/workflows/lintlang.yml
+
   # ─────────────────────────────────────────────────────────────────────
   # Gate: runs after everything. ``if: always()`` ensures it reports a
   # status even when some deps were skipped. Only actual ``failure``
@@ -233,6 +237,7 @@ jobs:
       - supply-chain
       - review-labels
       - osv-scanner
+      - lintlang
       # The image build runs in its own workflow (docker.yml) and reports
       # its own check. It was never required here, because it is too slow
       # to block a merge. A separate run also stops it from holding this
