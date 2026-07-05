@@ -359,10 +359,14 @@ class TestPluginDiscovery:
         mgr.discover_and_load()
         mgr.discover_and_load()  # second call should no-op
 
-        # Filter out bundled plugins — they're always discovered.
+        # Filter to just our fixture's own user-dir plugin. Scoping by
+        # source=="user" (rather than the weaker source!="bundled") also
+        # excludes any real pip entry-point plugins that happen to be
+        # installed in this venv (e.g. a community plugin like rtk-hermes) —
+        # those are process-wide discoveries unrelated to this fixture.
         non_bundled = {
             n: p for n, p in mgr._plugins.items()
-            if p.manifest.source != "bundled"
+            if p.manifest.source == "user"
         }
         assert len(non_bundled) == 1
 
@@ -394,9 +398,13 @@ class TestPluginDiscovery:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
         mgr.discover_and_load()
         assert mgr._discovered is True
+        # Scope to source=="user" (our fixture's own plugin dir), not just
+        # !="bundled" — excludes real pip entry-point plugins installed in
+        # this venv (e.g. rtk-hermes), which are process-wide and unrelated
+        # to this fixture.
         non_bundled = {
             n: p for n, p in mgr._plugins.items()
-            if p.manifest.source != "bundled"
+            if p.manifest.source == "user"
         }
         assert len(non_bundled) == 1
 
@@ -409,10 +417,13 @@ class TestPluginDiscovery:
         mgr = PluginManager()
         mgr.discover_and_load()
 
-        # Filter out bundled plugins — they're always discovered.
+        # Scope to source=="user" (our fixture's own plugin dir), not just
+        # !="bundled" — excludes real pip entry-point plugins installed in
+        # this venv (e.g. rtk-hermes), which are process-wide and unrelated
+        # to this fixture.
         non_bundled = {
             n: p for n, p in mgr._plugins.items()
-            if p.manifest.source != "bundled"
+            if p.manifest.source == "user"
         }
         assert len(non_bundled) == 0
 

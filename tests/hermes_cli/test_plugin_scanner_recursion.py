@@ -120,9 +120,13 @@ class TestCategoryNamespaceRecursion:
         mgr = PluginManager()
         mgr.discover_and_load()
 
+        # Scope to source=="user" (this fixture's own plugin dir), not just
+        # !="bundled" — excludes real pip entry-point plugins installed in
+        # this venv (e.g. rtk-hermes), which are process-wide and unrelated
+        # to this fixture.
         non_bundled = [
             k for k, p in mgr._plugins.items()
-            if p.manifest.source != "bundled"
+            if p.manifest.source == "user"
         ]
         assert non_bundled == []
 
