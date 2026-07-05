@@ -2392,11 +2392,19 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
         return None, None
 
     pool_present, entry = _select_pool_entry("anthropic")
-    if pool_present:
-        if entry is None:
-            return None, None
+    if pool_present and entry is not None:
         token = explicit_api_key or _pool_runtime_api_key(entry)
     else:
+        # Pool absent, OR pool present but no usable entry (expired token +
+        # stale refresh_token, all entries exhausted, etc). Fall through to the
+        # legacy resolver instead of hard-failing: a temporarily dead pool
+        # entry must not wedge auxiliary tasks when a valid standalone
+        # credential (ANTHROPIC_TOKEN, credentials file, API key) exists. This
+        # matches the openrouter and codex paths, which already fall back to
+        # their env/auth-store credential on (True, None). Without this, the
+        # goal judge and every other Anthropic-routed side channel died with
+        # "no auxiliary client configured" while the main session stayed
+        # healthy (it resolves the env token directly).
         entry = None
         token = explicit_api_key or resolve_anthropic_token()
     if not token:
@@ -5523,6 +5531,18 @@ def _resolve_task_provider_model(
         provider, base_url = _expand_direct_api_alias(provider, base_url)
     if cfg_provider:
         cfg_provider, cfg_base_url = _expand_direct_api_alias(cfg_provider, cfg_base_url)
+
+    # An explicit provider arg without an explicit base_url must not bypass
+    # the task's configured endpoint: adopt auxiliary.<task>.base_url/api_key
+    # when the config targets the same provider (or names none), so the
+    # early `if provider:` return below carries the configured endpoint
+    # instead of falling through to main-runtime resolution (#58515).
+    # An explicit "auto" is excluded — it means "inherit / auto-detect" and
+    # must keep flowing through the existing auto-resolution chain.
+    if provider and provider != "auto" and not base_url and cfg_base_url and cfg_provider in (None, provider):
+        base_url = cfg_base_url
+        if not api_key:
+            api_key = cfg_api_key
 
     if base_url and _preserve_provider_with_base_url(provider):
         return provider, resolved_model, base_url, api_key, resolved_api_mode
