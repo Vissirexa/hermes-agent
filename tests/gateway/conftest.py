@@ -82,6 +82,28 @@ def _ensure_telegram_mock() -> None:
     # Update.ALL_TYPES used in start_polling()
     mod.Update.ALL_TYPES = []
 
+    # Real classes (not MagicMock) for the reply-keyboard types so tests can
+    # assert on is_persistent/keyboard layout and isinstance() the remove
+    # marker (quick-keyboard tests). Inline keyboard types stay MagicMock —
+    # older tests assert on their mock call behavior.
+    class _FakeKeyboardButton:
+        def __init__(self, text, **kwargs):
+            self.text = text
+
+    class _FakeReplyKeyboardMarkup:
+        def __init__(self, keyboard, is_persistent=None, resize_keyboard=None, **kwargs):
+            self.keyboard = keyboard
+            self.is_persistent = is_persistent
+            self.resize_keyboard = resize_keyboard
+
+    class _FakeReplyKeyboardRemove:
+        def __init__(self, **kwargs):
+            self.remove_keyboard = True
+
+    mod.KeyboardButton = _FakeKeyboardButton
+    mod.ReplyKeyboardMarkup = _FakeReplyKeyboardMarkup
+    mod.ReplyKeyboardRemove = _FakeReplyKeyboardRemove
+
     for name in (
         "telegram",
         "telegram.ext",

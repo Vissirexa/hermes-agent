@@ -9399,6 +9399,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "topic":
             return await self._handle_topic_command(event)
+
+        if canonical == "keyboard":
+            # Telegram intercepts /keyboard adapter-side (reply keyboards are
+            # a Telegram client surface); reaching here means another platform.
+            return "The quick keyboard is Telegram-only — use /keyboard in a Telegram chat."
         
         if canonical == "help":
             return await self._handle_help_command(event)

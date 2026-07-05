@@ -16,7 +16,7 @@ import os
 import html as _html
 import re
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set, Any
+from typing import Callable, Dict, List, Optional, Set, Any
 
 logger = logging.getLogger(__name__)
 
@@ -1519,6 +1519,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 rich_sent_store.record(str(chat_id), str(message_id), content)
             except Exception:
                 pass
+            self._track_outbound_for_quick_actions(chat_id, message_id)
         return SendResult(
             success=True,
             message_id=str(message_id) if message_id is not None else None,
@@ -1606,6 +1607,7 @@ class TelegramAdapter(BasePlatformAdapter):
             rich_sent_store.record(str(chat_id), str(message_id), content)
         except Exception:
             pass
+        self._track_outbound_for_quick_actions(chat_id, message_id)
         return SendResult(success=True, message_id=message_id)
 
     def _should_attempt_rich_draft(self, content: str) -> bool:
@@ -3541,6 +3543,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 except Exception:
                     pass  # Typing failures are non-fatal
 
+            if message_ids:
+                self._track_outbound_for_quick_actions(chat_id, message_ids[-1])
             return SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
@@ -3998,6 +4002,7 @@ class TelegramAdapter(BasePlatformAdapter):
             "[%s] Overflow split delivered %d chunks; last_id=%s",
             self.name, 1 + len(continuation_ids), last_id,
         )
+        self._track_outbound_for_quick_actions(chat_id, last_id)
         return SendResult(
             success=True,
             message_id=last_id,
@@ -4993,6 +4998,18 @@ class TelegramAdapter(BasePlatformAdapter):
         # --- Gmail-triage callbacks (gt:verb:arg) ---
         if data.startswith("gt:"):
             await self._handle_gmail_triage_callback(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
+            return
+
+        # --- Quick-action callbacks (qa:key:message_id) ---
+        if data.startswith("qa:"):
+            await self._handle_quick_action_callback(
                 query,
                 data,
                 query_chat_id=query_chat_id,
@@ -7120,6 +7137,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(getattr(msg, "chat", None), "id", None),
             )
             return
+        await self._maybe_auto_attach_quick_keyboard(msg)
+        # Quick-keyboard taps arrive as plain text carrying the literal button
+        # label; intercept before mention gating and batching so a tap works
+        # deterministically even in mention-gated groups.
+        if await self._maybe_dispatch_quick_keyboard_label(msg, update_id=update.update_id):
+            return
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
@@ -7144,6 +7167,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[Telegram] Blocked unauthorized user %s in chat %s",
                 getattr(getattr(msg, "from_user", None), "id", None),
                 getattr(getattr(msg, "chat", None), "id", None),
+            )
+            return
+        await self._maybe_auto_attach_quick_keyboard(msg)
+        # /keyboard is Telegram-only (reply keyboards are a client surface),
+        # so it's handled here and never forwarded to the gateway.
+        cmd_token = (msg.text or "").strip().split()[0] if (msg.text or "").strip() else ""
+        if cmd_token.split("@")[0].lower() == "/keyboard":
+            await self._handle_keyboard_command(
+                msg, (msg.text or "").strip().partition(" ")[2]
             )
             return
         await self._ensure_forum_commands(msg)
@@ -8152,7 +8184,11 @@ class TelegramAdapter(BasePlatformAdapter):
         Without this clear, the only way to remove the 👀 was to wait for
         another agent run to swap it to 👍/👎 — which never happens if the
         cancellation was the last activity in the chat.
+
+        Also the quick-actions attach point: every send/edit for the turn has
+        finished here, so the inline row lands on a final message.
         """
+        await self._maybe_attach_quick_actions(event, outcome)
         if not self._reactions_enabled():
             return
         chat_id = getattr(event.source, "chat_id", None)
@@ -8288,22 +8324,35 @@ class TelegramAdapter(BasePlatformAdapter):
                 mr, emoji, entry, update_id=update.update_id
             )
 
-    def _reaction_message_event(
+    # ── Shared control-surface dispatch ────────────────────────────────────
+    #
+    # Reaction commands, quick-keyboard labels, and quick-action buttons are
+    # three triggers into one dispatch path: a config entry of
+    # {"action": "command", "command": ...} or {"action": "prompt", "prompt": ...}
+    # becomes either a synthetic COMMAND event (gateway early intercept, zero
+    # LLM tokens, works mid-run) or a synthetic TEXT turn, optionally anchored
+    # to an existing message.
+
+    def _control_surface_event(
         self,
-        mr: Any,
+        *,
+        chat: Any,
+        user: Any,
         text: str,
         msg_type: MessageType,
+        message_id: Optional[str] = None,
+        anchor_message_id: Optional[str] = None,
+        raw: Any = None,
         update_id: Optional[int] = None,
+        timestamp: Any = None,
     ) -> MessageEvent:
-        """Build a synthetic MessageEvent from a MessageReactionUpdated.
+        """Build a synthetic MessageEvent for a control-surface trigger.
 
-        The event anchors to the reacted message: message_id and
-        reply_to_message_id both point at it, and reply_to_text is resolved
-        from the send-time index when available so prompt actions carry the
-        content the user reacted to.
+        When ``anchor_message_id`` is given the event anchors to that message:
+        reply_to_message_id points at it and reply_to_text is resolved from the
+        send-time index when available, so prompt actions carry the content the
+        user acted on. Without an anchor the event is a fresh turn.
         """
-        chat = getattr(mr, "chat", None)
-        user = getattr(mr, "user", None)
         telegram_chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower()
         chat_type = "dm"
         if telegram_chat_type in {"group", "supergroup"}:
@@ -8311,13 +8360,13 @@ class TelegramAdapter(BasePlatformAdapter):
         elif telegram_chat_type == "channel":
             chat_type = "channel"
         chat_id = str(getattr(chat, "id", ""))
-        message_id = str(getattr(mr, "message_id", ""))
         reply_to_text = None
-        try:
-            from gateway import rich_sent_store
-            reply_to_text = rich_sent_store.lookup(chat_id, message_id)
-        except Exception:
-            reply_to_text = None
+        if anchor_message_id:
+            try:
+                from gateway import rich_sent_store
+                reply_to_text = rich_sent_store.lookup(chat_id, anchor_message_id)
+            except Exception:
+                reply_to_text = None
         source = self.build_source(
             chat_id=chat_id,
             chat_name=(
@@ -8334,13 +8383,37 @@ class TelegramAdapter(BasePlatformAdapter):
             text=text,
             message_type=msg_type,
             source=source,
-            raw_message=mr,
+            raw_message=raw,
             message_id=message_id,
             platform_update_id=update_id,
-            reply_to_message_id=message_id,
+            reply_to_message_id=anchor_message_id,
             reply_to_text=reply_to_text,
-            timestamp=getattr(mr, "date", None),
+            timestamp=timestamp,
         )
+
+    async def _dispatch_control_action(
+        self,
+        entry: Dict[str, str],
+        make_event: Callable[[str, MessageType], MessageEvent],
+        *,
+        trigger: str,
+        prompt_header: str = "",
+    ) -> None:
+        """Dispatch one control-surface entry as a command or a prompt turn.
+
+        ``make_event(text, msg_type)`` builds the trigger-specific event;
+        ``trigger`` is a human-readable description for logs; ``prompt_header``
+        is prefixed to prompt-action text (e.g. the anchor header).
+        """
+        if entry["action"] == "command":
+            event = make_event(entry["command"], MessageType.COMMAND)
+            logger.info(
+                "[%s] %s → command %s", self.name, trigger, entry["command"]
+            )
+        else:
+            event = make_event(f"{prompt_header}{entry['prompt']}", MessageType.TEXT)
+            logger.info("[%s] %s → prompt turn", self.name, trigger)
+        await self.handle_message(event)
 
     async def _dispatch_reaction_action(
         self,
@@ -8350,27 +8423,494 @@ class TelegramAdapter(BasePlatformAdapter):
         update_id: Optional[int] = None,
     ) -> None:
         """Dispatch one mapped reaction as a command or an anchored prompt."""
-        if entry["action"] == "command":
-            event = self._reaction_message_event(
-                mr, entry["command"], MessageType.COMMAND, update_id=update_id
+        message_id = str(getattr(mr, "message_id", ""))
+
+        def make_event(text: str, msg_type: MessageType) -> MessageEvent:
+            return self._control_surface_event(
+                chat=getattr(mr, "chat", None),
+                user=getattr(mr, "user", None),
+                text=text,
+                msg_type=msg_type,
+                message_id=message_id,
+                anchor_message_id=message_id,
+                raw=mr,
+                update_id=update_id,
+                timestamp=getattr(mr, "date", None),
             )
-            logger.info(
-                "[%s] Reaction %s on message %s → command %s",
-                self.name, emoji, getattr(mr, "message_id", None), entry["command"],
-            )
-        else:
-            text = (
+
+        await self._dispatch_control_action(
+            entry,
+            make_event,
+            trigger=f"Reaction {emoji} on message {getattr(mr, 'message_id', None)}",
+            prompt_header=(
                 f"[User reacted with {emoji} to message "
-                f"{getattr(mr, 'message_id', None)}] {entry['prompt']}"
+                f"{getattr(mr, 'message_id', None)}] "
+            ),
+        )
+
+    # ── Quick keyboard (persistent reply keyboard) ─────────────────────────
+    #
+    # Always-visible buttons under the Telegram input box. Tapping a button
+    # sends its literal label text as an ordinary message; the adapter
+    # intercepts exact label matches post-auth and dispatches them through the
+    # shared control-surface path — the model never sees the label. Configured
+    # via config.extra["quick_keyboard"]; disabled by default.
+
+    @staticmethod
+    def _parse_control_entry(raw_entry: Any) -> Optional[Dict[str, str]]:
+        """Validate one ``{action: command|prompt, ...}`` config entry."""
+        if not isinstance(raw_entry, dict):
+            return None
+        action = str(raw_entry.get("action", "")).strip().lower()
+        if action == "command" and str(raw_entry.get("command", "")).strip():
+            return {"action": "command", "command": str(raw_entry["command"]).strip()}
+        if action == "prompt" and str(raw_entry.get("prompt", "")).strip():
+            return {"action": "prompt", "prompt": str(raw_entry["prompt"]).strip()}
+        return None
+
+    def _quick_keyboard_config(self) -> Dict[str, Any]:
+        """Resolve the quick-keyboard config from config.extra + env.
+
+        Returns ``{"enabled": bool, "rows": [[entry, ...], ...],
+        "labels": {label: entry}}`` where each entry carries ``label`` plus
+        ``{"action": "command", "command": ...}`` or
+        ``{"action": "prompt", "prompt": ...}``. ``buttons`` accepts a list of
+        rows (list of lists) or a flat list of buttons (each its own row —
+        safe layout on phones). Malformed buttons are dropped; duplicate
+        labels keep the first occurrence. ``TELEGRAM_QUICK_KEYBOARD`` env
+        overrides the enabled flag.
+        """
+        raw = self.config.extra.get("quick_keyboard")
+        raw = raw if isinstance(raw, dict) else {}
+        enabled = str(raw.get("enabled", "")).strip().lower() in {"true", "1", "yes"}
+        env = os.getenv("TELEGRAM_QUICK_KEYBOARD")
+        if env is not None and env.strip():
+            enabled = env.strip().lower() not in {"false", "0", "no"}
+        raw_buttons = raw.get("buttons")
+        rows: List[List[Dict[str, str]]] = []
+        labels: Dict[str, Dict[str, str]] = {}
+        for raw_row in raw_buttons if isinstance(raw_buttons, list) else []:
+            if isinstance(raw_row, dict):
+                raw_row = [raw_row]
+            if not isinstance(raw_row, list):
+                continue
+            row: List[Dict[str, str]] = []
+            for raw_btn in raw_row:
+                entry = self._parse_control_entry(raw_btn)
+                label = (
+                    str(raw_btn.get("label", "")).strip()
+                    if isinstance(raw_btn, dict) else ""
+                )
+                if not entry or not label or label in labels:
+                    continue
+                entry["label"] = label
+                row.append(entry)
+                labels[label] = entry
+            if row:
+                rows.append(row)
+        return {"enabled": enabled, "rows": rows, "labels": labels}
+
+    @staticmethod
+    def _quick_keyboard_markup(rows: List[List[Dict[str, str]]]) -> Any:
+        from telegram import KeyboardButton, ReplyKeyboardMarkup
+        return ReplyKeyboardMarkup(
+            [[KeyboardButton(btn["label"]) for btn in row] for row in rows],
+            is_persistent=True,
+            resize_keyboard=True,
+        )
+
+    @staticmethod
+    def _quick_keyboard_fingerprint(rows: List[List[Dict[str, str]]]) -> str:
+        """Stable fingerprint of the keyboard *layout* (labels only).
+
+        Action remaps don't change the client-side keyboard, so they don't
+        require a re-attach — dispatch is resolved server-side per tap.
+        """
+        return json.dumps(
+            [[btn["label"] for btn in row] for row in rows], ensure_ascii=False
+        )
+
+    @staticmethod
+    def _quick_keyboard_store_path() -> str:
+        # Resolve via get_hermes_home() so the active profile override is
+        # honored (same pattern as gateway/rich_sent_store.py).
+        from hermes_constants import get_hermes_home
+        return os.path.join(
+            str(get_hermes_home()), "state", "telegram_quick_keyboard.json"
+        )
+
+    def _quick_keyboard_stored_fp(self, chat_id: str) -> Optional[str]:
+        """Last-attached layout fingerprint for ``chat_id``, or None."""
+        try:
+            with open(self._quick_keyboard_store_path(), "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            val = data.get(str(chat_id))
+            return val if isinstance(val, str) else None
+        except Exception:
+            return None
+
+    def _quick_keyboard_record_fp(self, chat_id: str, fp: Optional[str]) -> None:
+        """Best-effort persist the attached fingerprint (None clears it)."""
+        path = self._quick_keyboard_store_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                if not isinstance(data, dict):
+                    data = {}
+            except Exception:
+                data = {}
+            if fp is None:
+                data.pop(str(chat_id), None)
+            else:
+                data[str(chat_id)] = fp
+            tmp = f"{path}.tmp.{os.getpid()}"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception:
+            return
+
+    async def _attach_quick_keyboard(
+        self,
+        chat_id: str,
+        thread_id: Optional[int] = None,
+        note: str = "⌨️ Quick keyboard updated.",
+    ) -> bool:
+        """Send the configured reply keyboard (rides on a short notice message,
+        since Telegram only attaches reply keyboards via a message's
+        reply_markup)."""
+        cfg = self._quick_keyboard_config()
+        if not cfg["rows"] or not self._bot:
+            return False
+        kwargs: Dict[str, Any] = {
+            "chat_id": normalize_telegram_chat_id(chat_id),
+            "text": note,
+            "reply_markup": self._quick_keyboard_markup(cfg["rows"]),
+        }
+        if thread_id is not None:
+            kwargs["message_thread_id"] = thread_id
+        try:
+            await self._send_message_with_thread_fallback(**kwargs)
+        except Exception as e:
+            logger.warning("[%s] Quick keyboard attach failed: %s", self.name, e)
+            return False
+        self._quick_keyboard_record_fp(
+            chat_id, self._quick_keyboard_fingerprint(cfg["rows"])
+        )
+        logger.info("[%s] Quick keyboard attached in chat %s", self.name, chat_id)
+        return True
+
+    async def _remove_quick_keyboard(
+        self, chat_id: str, thread_id: Optional[int] = None
+    ) -> bool:
+        from telegram import ReplyKeyboardRemove
+        if not self._bot:
+            return False
+        kwargs: Dict[str, Any] = {
+            "chat_id": normalize_telegram_chat_id(chat_id),
+            "text": "⌨️ Quick keyboard removed. /keyboard brings it back.",
+            "reply_markup": ReplyKeyboardRemove(),
+        }
+        if thread_id is not None:
+            kwargs["message_thread_id"] = thread_id
+        try:
+            await self._send_message_with_thread_fallback(**kwargs)
+        except Exception as e:
+            logger.warning("[%s] Quick keyboard remove failed: %s", self.name, e)
+            return False
+        self._quick_keyboard_record_fp(chat_id, None)
+        logger.info("[%s] Quick keyboard removed in chat %s", self.name, chat_id)
+        return True
+
+    @staticmethod
+    def _message_thread_id_for_control(msg: Any) -> Optional[int]:
+        """Thread id for control replies: only real forum-topic messages."""
+        if getattr(msg, "is_topic_message", False):
+            return getattr(msg, "message_thread_id", None)
+        return None
+
+    async def _maybe_auto_attach_quick_keyboard(self, msg: Any) -> None:
+        """Auto-attach the keyboard when its configured layout changed.
+
+        Checked once per chat per gateway run, on the first processed inbound
+        message. ``is_persistent`` keyboards survive client-side across
+        restarts, so the attach message is only sent when the configured
+        labels differ from the last-attached fingerprint — config changes
+        propagate after a restart without a notice on *every* restart.
+        DM-only: groups get the keyboard via an explicit /keyboard (a reply
+        keyboard in a group shows for all members, so never attach uninvited).
+        """
+        cfg = self._quick_keyboard_config()
+        if not (cfg["enabled"] and cfg["rows"]):
+            return
+        chat = getattr(msg, "chat", None)
+        if str(getattr(chat, "type", "")).split(".")[-1].lower() != "private":
+            return
+        chat_id = str(getattr(chat, "id", "") or "")
+        if not chat_id:
+            return
+        # getattr() — tests build adapters via object.__new__() (no __init__).
+        checked = getattr(self, "_quick_keyboard_auto_checked", None)
+        if checked is None:
+            checked = self._quick_keyboard_auto_checked = set()
+        if chat_id in checked:
+            return
+        checked.add(chat_id)
+        fp = self._quick_keyboard_fingerprint(cfg["rows"])
+        if self._quick_keyboard_stored_fp(chat_id) == fp:
+            return
+        await self._attach_quick_keyboard(
+            chat_id, thread_id=self._message_thread_id_for_control(msg)
+        )
+
+    async def _maybe_dispatch_quick_keyboard_label(
+        self, msg: Any, update_id: Optional[int] = None
+    ) -> bool:
+        """Intercept a text message that exactly matches a keyboard label.
+
+        Returns True when the message was dispatched as a control action (the
+        caller must stop normal processing). Reply-keyboard taps arrive as
+        ordinary text messages carrying the literal label, so this runs before
+        mention gating and batching; a user typing the label manually gets the
+        same deterministic dispatch.
+        """
+        cfg = self._quick_keyboard_config()
+        if not cfg["enabled"]:
+            return False
+        entry = cfg["labels"].get((getattr(msg, "text", "") or "").strip())
+        if not entry:
+            return False
+
+        message_id = str(getattr(msg, "message_id", ""))
+
+        def make_event(text: str, msg_type: MessageType) -> MessageEvent:
+            return self._control_surface_event(
+                chat=getattr(msg, "chat", None),
+                user=getattr(msg, "from_user", None),
+                text=text,
+                msg_type=msg_type,
+                message_id=message_id,
+                raw=msg,
+                update_id=update_id,
+                timestamp=getattr(msg, "date", None),
             )
-            event = self._reaction_message_event(
-                mr, text, MessageType.TEXT, update_id=update_id
+
+        await self._dispatch_control_action(
+            entry,
+            make_event,
+            trigger=f"Quick keyboard {entry['label']!r}",
+        )
+        return True
+
+    async def _handle_keyboard_command(self, msg: Any, args: str) -> None:
+        """Handle /keyboard [off]: attach or remove the quick reply keyboard.
+
+        Handled adapter-side (never reaches the gateway) because the reply
+        keyboard is a Telegram-only client surface.
+        """
+        chat_id = str(getattr(getattr(msg, "chat", None), "id", "") or "")
+        thread_id = self._message_thread_id_for_control(msg)
+        arg = args.strip().lower()
+        if arg in {"off", "remove", "hide"}:
+            await self._remove_quick_keyboard(chat_id, thread_id=thread_id)
+            return
+        cfg = self._quick_keyboard_config()
+        if not cfg["rows"]:
+            await self.send(
+                chat_id,
+                "No quick keyboard buttons configured "
+                "(telegram.quick_keyboard.buttons in config.yaml).",
+            )
+            return
+        if not cfg["enabled"]:
+            await self.send(
+                chat_id,
+                "Quick keyboard is disabled "
+                "(set telegram.quick_keyboard.enabled: true in config.yaml).",
+            )
+            return
+        await self._attach_quick_keyboard(
+            chat_id,
+            thread_id=thread_id,
+            note="⌨️ Quick keyboard attached. /keyboard off removes it.",
+        )
+
+    # ── Quick actions (inline buttons under the final response) ────────────
+    #
+    # A row of inline buttons attached to the final response message *after*
+    # delivery via edit_message_reply_markup — immune by construction to the
+    # streaming race that bites reactions on drafts (the buttons only appear
+    # once the message is final). Callback data is "qa:<key>:<message_id>";
+    # the key→action mapping lives in config so callbacks stay far under
+    # Telegram's 64-byte callback_data cap. Configured via
+    # config.extra["quick_actions"]; disabled by default.
+
+    _QUICK_ACTION_KEY_RE = re.compile(r"[a-z0-9_-]{1,32}")
+
+    def _quick_actions_config(self) -> Dict[str, Any]:
+        """Resolve the quick-actions config from config.extra + env.
+
+        Returns ``{"enabled": bool, "buttons": [entry, ...],
+        "keys": {key: entry}}`` where each entry carries ``key`` + ``label``
+        plus ``{"action": "command", "command": ...}`` or
+        ``{"action": "prompt", "prompt": ...}``. Keys must match
+        ``[a-z0-9_-]{1,32}`` (callback data is ``qa:<key>:<message_id>`` and
+        must stay under the 64-byte cap); malformed buttons are dropped and
+        duplicate keys keep the first occurrence. ``TELEGRAM_QUICK_ACTIONS``
+        env overrides the enabled flag.
+        """
+        raw = self.config.extra.get("quick_actions")
+        raw = raw if isinstance(raw, dict) else {}
+        enabled = str(raw.get("enabled", "")).strip().lower() in {"true", "1", "yes"}
+        env = os.getenv("TELEGRAM_QUICK_ACTIONS")
+        if env is not None and env.strip():
+            enabled = env.strip().lower() not in {"false", "0", "no"}
+        buttons: List[Dict[str, str]] = []
+        keys: Dict[str, Dict[str, str]] = {}
+        raw_buttons = raw.get("buttons")
+        for raw_btn in raw_buttons if isinstance(raw_buttons, list) else []:
+            entry = self._parse_control_entry(raw_btn)
+            if not entry:
+                continue
+            key = str(raw_btn.get("key", "")).strip().lower()
+            label = str(raw_btn.get("label", "")).strip()
+            if not label or not self._QUICK_ACTION_KEY_RE.fullmatch(key) or key in keys:
+                continue
+            entry["key"] = key
+            entry["label"] = label
+            buttons.append(entry)
+            keys[key] = entry
+        return {"enabled": enabled, "buttons": buttons, "keys": keys}
+
+    def _track_outbound_for_quick_actions(self, chat_id: Any, message_id: Any) -> None:
+        """Remember the newest outbound response message per chat.
+
+        Called from every response delivery surface (legacy send, rich send,
+        legacy/rich edits) so on_processing_complete knows which message is
+        the final one to hang the quick-action row on.
+        """
+        if not chat_id or message_id is None:
+            return
+        # getattr() — tests build adapters via object.__new__() (no __init__).
+        store = getattr(self, "_qa_last_outbound", None)
+        if store is None:
+            store = self._qa_last_outbound = {}
+        store[str(chat_id)] = str(message_id)
+
+    async def _maybe_attach_quick_actions(
+        self, event: MessageEvent, outcome: ProcessingOutcome
+    ) -> None:
+        """Attach the quick-action row to the final response after delivery.
+
+        Rides on_processing_complete: by then every send/edit for the turn has
+        finished, so edit_message_reply_markup targets a final message. Never
+        raises — a failed attach must not disturb the completed turn.
+        """
+        try:
+            if outcome != ProcessingOutcome.SUCCESS:
+                return
+            if getattr(event, "message_type", None) == MessageType.COMMAND:
+                # Slash-command output (incl. control-surface /stop etc.)
+                # isn't a response worth a Retry/Continue row.
+                return
+            cfg = self._quick_actions_config()
+            if not (cfg["enabled"] and cfg["buttons"]) or not self._bot:
+                return
+            chat_id = str(getattr(event.source, "chat_id", "") or "")
+            # pop() — one-shot per outbound message, so a later turn whose
+            # delivery failed can't re-attach to this (stale) id.
+            message_id = (getattr(self, "_qa_last_outbound", None) or {}).pop(
+                chat_id, None
+            )
+            if not (chat_id and message_id):
+                return
+            row_cap = 3  # phone-width layout
+            btns = [
+                InlineKeyboardButton(
+                    b["label"], callback_data=f"qa:{b['key']}:{message_id}"
+                )
+                for b in cfg["buttons"]
+            ]
+            keyboard = InlineKeyboardMarkup(
+                [btns[i:i + row_cap] for i in range(0, len(btns), row_cap)]
+            )
+            await self._bot.edit_message_reply_markup(
+                chat_id=normalize_telegram_chat_id(chat_id),
+                message_id=int(message_id),
+                reply_markup=keyboard,
             )
             logger.info(
-                "[%s] Reaction %s on message %s → prompt turn",
-                self.name, emoji, getattr(mr, "message_id", None),
+                "[%s] Quick actions attached to message %s in chat %s",
+                self.name, message_id, chat_id,
             )
-        await self.handle_message(event)
+        except Exception as e:
+            logger.debug(
+                "[%s] Quick action attach failed (non-fatal): %s", self.name, e
+            )
+
+    async def _handle_quick_action_callback(
+        self,
+        query: Any,
+        data: str,
+        *,
+        query_chat_id: Any,
+        query_chat_type: Any,
+        query_thread_id: Any,
+        query_user_name: Any,
+    ) -> None:
+        """Handle a qa:<key>:<message_id> button tap.
+
+        Auth-gated like the ea:/sc: callbacks (fail closed); always answers
+        the callback so the client spinner stops. Stale keys (button outlived
+        a config change, or the feature was disabled) toast without dispatch.
+        """
+        parts = data.split(":", 2)
+        if len(parts) != 3 or not parts[1] or not parts[2]:
+            await query.answer(text="Invalid button data.")
+            return
+        _, key, anchor_id = parts
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to use these buttons.")
+            return
+        cfg = self._quick_actions_config()
+        entry = cfg["keys"].get(key) if cfg["enabled"] else None
+        if not entry:
+            await query.answer(text="This button is no longer configured.")
+            return
+        message = getattr(query, "message", None)
+        chat = getattr(message, "chat", None)
+        if chat is None:
+            # Inaccessible/ancient message — no chat context to dispatch into.
+            await query.answer(text="This message is too old to act on.")
+            return
+        await query.answer(text=entry["label"])
+
+        def make_event(text: str, msg_type: MessageType) -> MessageEvent:
+            return self._control_surface_event(
+                chat=chat,
+                user=query.from_user,
+                text=text,
+                msg_type=msg_type,
+                message_id=str(anchor_id),
+                anchor_message_id=str(anchor_id),
+                raw=query,
+            )
+
+        await self._dispatch_control_action(
+            entry,
+            make_event,
+            trigger=f"Quick action {entry['label']!r} on message {anchor_id}",
+            prompt_header=f"[User tapped {entry['label']} on message {anchor_id}] ",
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -8502,6 +9042,12 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
 
     if "reaction_commands" in telegram_cfg:
         extras.setdefault("reaction_commands", telegram_cfg["reaction_commands"])
+
+    if "quick_keyboard" in telegram_cfg:
+        extras.setdefault("quick_keyboard", telegram_cfg["quick_keyboard"])
+
+    if "quick_actions" in telegram_cfg:
+        extras.setdefault("quick_actions", telegram_cfg["quick_actions"])
 
     _effective_rm = telegram_cfg.get("require_mention", yaml_cfg.get("require_mention"))
     if _effective_rm is not None and not os.getenv("TELEGRAM_REQUIRE_MENTION"):

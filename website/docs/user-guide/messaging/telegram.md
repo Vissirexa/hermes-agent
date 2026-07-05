@@ -1258,6 +1258,62 @@ In group chats, Telegram only delivers reaction updates if the bot is an **admin
 **React to a stable message.** A reaction tapped on a message that is actively streaming (being edited every second) can race the edit and never commit — the emoji appears briefly, then vanishes, and Telegram never delivers the update to the bot. Streamed drafts can also be deleted and replaced on finalization, taking reactions with them. For mid-run stops, react to your **own last message** (it is never edited) or any older bot message; if your reaction visibly disappears, it didn't register — tap it again on a stable message.
 :::
 
+## Quick Keyboard
+
+An always-visible row (or rows) of buttons under the Telegram input box, backed by a persistent [reply keyboard](https://core.telegram.org/bots/features#keyboards). Tapping a button sends its label as an ordinary message; the adapter intercepts exact label matches **before** the model sees them and dispatches the mapped action deterministically — same action kinds as reaction commands, but discoverable (visible labels instead of a memorized emoji map) and usable even when there's no recent message to react to.
+
+Disabled by default. Enable in `config.yaml`:
+
+```yaml
+telegram:
+  quick_keyboard:
+    enabled: true
+    buttons:                       # list of rows (keep ≤3 per row for phones)
+      - - { label: "⏹ Stop",      action: command, command: "/stop" }
+        - { label: "📊 Status",    action: command, command: "/status" }
+      - - { label: "📝 Summarize", action: prompt,  prompt: "Summarize the current state of this task briefly." }
+```
+
+Or force the enabled flag with `TELEGRAM_QUICK_KEYBOARD=true|false` (overrides `telegram.quick_keyboard.enabled`). A flat `buttons:` list (no nesting) also works — each button gets its own row.
+
+- **`command`** buttons dispatch like typed commands; `⏹ Stop` rides the gateway's early intercept and interrupts a running agent mid-generation.
+- **`prompt`** buttons inject the configured prompt as a fresh user turn.
+
+Attach and remove with **`/keyboard`** / **`/keyboard off`**. In private chats the keyboard also auto-attaches on your first message after a restart **when the configured button layout changed** (the layout fingerprint is remembered per chat, so unchanged restarts stay silent). Groups never get the keyboard automatically — reply keyboards show for *all* group members, so attach there deliberately with `/keyboard`.
+
+:::note
+Label matching is exact (emoji included, surrounding whitespace ignored). Typing a label manually triggers the same dispatch as tapping the button — deterministic either way. Because taps arrive as plain text, the intercept runs after user authorization but before group mention-gating, so buttons work in mention-gated groups too.
+:::
+
+## Quick Actions
+
+A row of inline buttons attached **under the bot's final response** after it is delivered. Because the row is added post-delivery via `edit_message_reply_markup`, it cannot race streaming edits the way reactions on a draft can — the buttons only ever appear on a finished message.
+
+Disabled by default. Enable in `config.yaml`:
+
+```yaml
+telegram:
+  quick_actions:
+    enabled: true
+    buttons:
+      - { key: retry, label: "🔁 Retry",    action: prompt,  prompt: "That wasn't right — try again with a different approach." }
+      - { key: more,  label: "▶️ Continue", action: prompt,  prompt: "Continue." }
+      - { key: stop,  label: "⏹ Stop",     action: command, command: "/stop" }
+```
+
+Or force the enabled flag with `TELEGRAM_QUICK_ACTIONS=true|false` (overrides `telegram.quick_actions.enabled`).
+
+Each button needs a `key` (`a-z`, `0-9`, `_`, `-`; max 32 chars) — the callback carries only `key` + message id, and the key→action mapping is resolved from config *at tap time*. Prompt actions are anchored to the message the button hangs on (the turn carries `[User tapped 🔁 Retry on message …]` plus the message content when it can be resolved), so a Retry on an older response unambiguously retries *that* response.
+
+- Buttons appear under responses to normal messages, not under slash-command output.
+- Buttons on old messages stay tappable; the anchor keeps the turn unambiguous.
+- A tapped key that is no longer in config (or the feature was disabled) shows a "no longer configured" toast and dispatches nothing.
+- The same user allowlists that gate messages gate button taps (fail closed).
+
+:::note
+A Telegram message carries *either* an inline keyboard *or* a reply keyboard — but the two features don't conflict: the quick keyboard is attached once and persists client-side, while quick actions are edited onto each response message.
+:::
+
 ## Per-Channel Prompts
 
 Assign ephemeral system prompts to specific Telegram groups or forum topics. The prompt is injected at runtime on every turn — never persisted to transcript history — so changes take effect immediately.
