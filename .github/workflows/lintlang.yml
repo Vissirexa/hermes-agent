@@ -1,0 +1,123 @@
+name: lintlang (agent config/prompt lint)
+
+# Static, offline lint of this repo's agent config + prompt surface using
+# lintlang (canonical repo: hermes-labs-ai/lintlang, PyPI package
+# `lintlang`, pinned by version below). H1-H7 structural checks over
+# YAML/JSON/Markdown — no LLM calls, no network access on this codepath.
+#
+# ─────────────────────────────────────────────────────────────────────────
+# Why pinned to an exact version, and why never pointed at *.py
+# ─────────────────────────────────────────────────────────────────────────
+# lintlang's name has typosquat-risk clones on GitHub; the canonical repo
+# was identified via PyPI `project_urls` metadata cross-checked against the
+# GitHub org transfer history (see
+# plugin-adoption/01-vet-observability-set.md and
+# plugin-adoption/05-lintlang-phase1a.md in the harness-performance repo).
+# Pin the version here rather than trusting an unpinned `pip install
+# lintlang` to keep the installed artifact reproducible.
+#
+# Separately: lintlang v0.2.2 ships an experimental Python-source
+# extractor (`scan_python_file`, only reached when a `.py` file is passed
+# directly) that POSTs extracted prompt strings to a local Ollama
+# embedding endpoint (`localhost:11434`) with no opt-out flag — this
+# contradicts the README's "no network access" claim. That codepath is
+# NEVER reached by `scan_directory()` (the `.py` extension isn't in its
+# allow-list), and this workflow only ever passes directories/non-.py
+# files below — never a `.py` file — so it's not reachable here. Do not
+# add a `.py` file to the `files:` step's argument list without re-reading
+# that finding first.
+#
+# ─────────────────────────────────────────────────────────────────────────
+# Advisory only for now (Phase 1a)
+# ─────────────────────────────────────────────────────────────────────────
+# This repo's skills/optional-skills tree is long-form reference
+# documentation, not tight system prompts — lintlang's H4/H5/H6 heuristics
+# (assume every scanned file IS a system prompt: "no version marker", "no
+# priority ordering", etc.) fire at high volume on that content. Until
+# those findings are triaged and either fixed or added to
+# .lintlangignore, this job never fails the build (`--fail-on` is
+# intentionally omitted). It only posts a markdown summary so findings
+# stay visible. Tightening this into a blocking gate is future work, not
+# part of this rollout.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lintlang-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: lintlang scan (configs + prompts)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v5
+        with:
+          python-version: "3.11"
+
+      - name: Install lintlang (pinned, PyPI)
+        uses: ./.github/actions/retry
+        with:
+          command: python -m pip install --disable-pip-version-check lintlang==0.2.2
+
+      - name: Run lintlang over agent config/prompt surface
+        # Directories and files here are the repo's agent-facing config +
+        # prompt surface: bundled/optional skill instructions, plugin
+        # manifests, optional-MCP manifests, the ACP registry descriptor,
+        # the root agent instructions file, and the example CLI config.
+        # Excludes are non-prompt data files that happen to share an
+        # extension lintlang scans (cached skill-index JSON, ComfyUI
+        # workflow graphs, OSINT broker reference data, two pentest-skill
+        # JSON fixtures, and npm package manifests picked up from a
+        # sidecar directory) — none of these are agent-authored config or
+        # prompt text.
+        #
+        # NOTE on --exclude patterns: lintlang 0.2.2's glob-to-regex
+        # translation in scan_directory() breaks on patterns using the
+        # documented `**/` prefix form (its own --help example) — the
+        # translation's four chained .replace() calls corrupt the
+        # optional-group `?` from `**/` during the final `?` pass, so a
+        # pattern like `**/index-cache/*.json` silently matches nothing.
+        # Confirmed by direct testing; see
+        # plugin-adoption/05-lintlang-phase1a.md. Worked around below by
+        # using plain path-fragment patterns (no `**` token) instead —
+        # matching relies on `re.search` doing substring matching, which
+        # doesn't need the `**/` prefix at all.
+        run: |
+          lintlang scan \
+            skills optional-skills plugins optional-mcps acp_registry \
+            AGENTS.md cli-config.yaml.example \
+            --exclude \
+              "index-cache/" \
+              "comfyui/workflows/" \
+              "references/brokers/" \
+              "godmode/templates/" \
+              "web-pentest/templates/" \
+              "package.json" \
+              "package-lock.json" \
+            --format json \
+            --no-suggestions \
+            > lintlang-report.json || true
+
+      - name: Summarize results
+        # The raw JSON is one object per scanned file (~780 files); far
+        # too long for a step summary. Aggregate to counts + the
+        # CRITICAL/HIGH findings only, and upload the full JSON as an
+        # artifact for anyone who needs the rest.
+        run: python3 scripts/ci/lintlang_summary.py lintlang-report.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload full report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: lintlang-report
+          path: lintlang-report.json
+          retention-days: 14

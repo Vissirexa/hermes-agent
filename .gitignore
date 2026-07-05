@@ -6,6 +6,7 @@
 __pycache__/
 .venv/
 .venv
+.venv-lintlang/
 .vscode/
 .env
 .env.local

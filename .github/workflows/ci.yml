@@ -127,6 +127,10 @@ jobs:
     name: OSV scan
     uses: ./.github/workflows/osv-scanner.yml
 
+  lintlang:
+    name: lintlang (agent config/prompt lint)
+    uses: ./.github/workflows/lintlang.yml
+
   # ─────────────────────────────────────────────────────────────────────
   # Gate: runs after everything. ``if: always()`` ensures it reports a
   # status even when some deps were skipped. Only actual ``failure``
@@ -147,6 +151,7 @@ jobs:
       - docker-lint
       - supply-chain
       - osv-scanner
+      - lintlang
       # we don't require docker to pass rn because it's so slow lol
       # - docker
     if: always()
