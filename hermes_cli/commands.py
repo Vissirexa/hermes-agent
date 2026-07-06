@@ -1165,7 +1165,10 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - moa: high-cost slash mode, available through /hermes moa to avoid
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "moa", "debug"})
+#   - keyboard: Telegram-specific (reply-keyboard attach/remove); a native Slack
+#     slash would displace a real command at the 50-command cap. /hermes keyboard
+#     still resolves on Slack, where it is a no-op by design.
+_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "moa", "debug", "keyboard"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
