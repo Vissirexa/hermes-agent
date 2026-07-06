@@ -1370,7 +1370,10 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform"})
+#   - keyboard: Telegram-specific (reply-keyboard attach/remove); a native Slack
+#     slash would displace a real command at the 50-command cap. /hermes keyboard
+#     still resolves on Slack, where it is a no-op by design.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "keyboard"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
