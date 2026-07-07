@@ -55,12 +55,15 @@ def test_config_parses_nested_warn_and_hard_stop_thresholds():
                 "exact_failure": 3,
                 "same_tool_failure": 4,
                 "idempotent_no_progress": 5,
+                "repeated_result": 9,
             },
             "hard_stop_after": {
                 "exact_failure": 6,
                 "same_tool_failure": 7,
                 "idempotent_no_progress": 8,
+                "repeated_result": 10,
             },
+            "repeated_result_min_chars": 64,
         }
     )
 
@@ -72,6 +75,17 @@ def test_config_parses_nested_warn_and_hard_stop_thresholds():
     assert cfg.exact_failure_block_after == 6
     assert cfg.same_tool_failure_halt_after == 7
     assert cfg.no_progress_block_after == 8
+    assert cfg.repeated_result_warn_after == 9
+    assert cfg.repeated_result_halt_after == 10
+    assert cfg.repeated_result_min_chars == 64
+
+
+def test_default_config_guardrail_block_matches_dataclass_defaults():
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    cfg = ToolCallGuardrailConfig.from_mapping(DEFAULT_CONFIG["tool_loop_guardrails"])
+
+    assert cfg == ToolCallGuardrailConfig()
 
 
 def test_default_repeated_identical_failed_call_warns_without_blocking():
