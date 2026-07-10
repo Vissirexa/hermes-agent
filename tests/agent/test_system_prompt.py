@@ -99,3 +99,20 @@ class TestCodingContextBlock:
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         agent = _make_agent(valid_tool_names=[], platform="cli")
         assert "coding agent" not in _stable_prompt(agent)
+
+
+class TestClarifyFirstSteer:
+    """Clarify-first steer: only injected when the clarify tool is actually
+    registered — naming an unavailable tool induces hallucinated calls."""
+
+    def test_present_when_clarify_registered(self):
+        agent = _make_agent(valid_tool_names=["clarify"])
+        assert "call clarify" in _stable_prompt(agent)
+
+    def test_absent_when_clarify_not_registered(self):
+        agent = _make_agent(valid_tool_names=["read_file"])
+        assert "call clarify" not in _stable_prompt(agent)
+
+    def test_absent_with_no_tools(self):
+        agent = _make_agent(valid_tool_names=[])
+        assert "call clarify" not in _stable_prompt(agent)
