@@ -12,10 +12,18 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 from utils import safe_json_loads
 from agent.tool_result_classification import file_mutation_result_landed
 
+
+# Web-fetch-family tools whose single argument (or argument list) names a URL
+# the model chose itself. These are the tools where a stuck model evades the
+# exact-signature guards above by mutating the URL slug on every retry
+# (verywellfamily.com/oci-card-renewal -> /oci-renewal-guide -> ...) while
+# hammering the same unreachable host. See ``domain_failure_budget`` below.
+WEB_FETCH_TOOL_NAMES = frozenset({"fetch_resilient", "web_extract", "browser_navigate"})
 
 IDEMPOTENT_TOOL_NAMES = frozenset(
     {
@@ -83,6 +91,7 @@ class ToolCallGuardrailConfig:
     assistant_repeat_warn_after: int = 2
     assistant_repeat_halt_after: int = 3
     assistant_repeat_min_chars: int = 40
+    domain_failure_budget: int = 6
     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
 
@@ -150,6 +159,10 @@ class ToolCallGuardrailConfig:
             assistant_repeat_min_chars=_positive_int(
                 data.get("assistant_repeat_min_chars"),
                 defaults.assistant_repeat_min_chars,
+            ),
+            domain_failure_budget=_positive_int(
+                hard_stop_after.get("domain_failure", data.get("domain_failure_budget")),
+                defaults.domain_failure_budget,
             ),
         )
 
@@ -264,6 +277,7 @@ class ToolCallGuardrailController:
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
         self._result_repeat_counts: dict[str, int] = {}
         self._assistant_msg_counts: dict[str, int] = {}
+        self._domain_failure_counts: dict[str, int] = {}
         self._halt_decision: ToolGuardrailDecision | None = None
 
     @property
@@ -271,9 +285,31 @@ class ToolCallGuardrailController:
         return self._halt_decision
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
-        signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
+        args = _coerce_args(args)
+        signature = ToolCallSignature.from_call(tool_name, args)
         if not self.config.hard_stop_enabled:
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
+
+        if tool_name in WEB_FETCH_TOOL_NAMES:
+            for host in _hosts_from_args(tool_name, args):
+                failure_count = self._domain_failure_counts.get(host, 0)
+                if failure_count >= self.config.domain_failure_budget:
+                    decision = ToolGuardrailDecision(
+                        action="block",
+                        code="domain_failure_budget_block",
+                        message=(
+                            f"Blocked {tool_name}: {host} has failed {failure_count} times "
+                            "this turn (HTTP error status and/or blocked responses across "
+                            "different URLs on this host). Guessing another URL on this "
+                            "domain will not help. Use web_search if available, try a "
+                            "different source/domain, or ask the user how to proceed."
+                        ),
+                        tool_name=tool_name,
+                        count=failure_count,
+                        signature=signature,
+                    )
+                    self._halt_decision = decision
+                    return decision
 
         exact_count = self._exact_failure_counts.get(signature, 0)
         if exact_count >= self.config.exact_failure_block_after:
@@ -326,6 +362,19 @@ class ToolCallGuardrailController:
         signature = ToolCallSignature.from_call(tool_name, args)
         if failed is None:
             failed, _ = classify_tool_failure(tool_name, result)
+
+        # Per-domain failure budget. Independent of the exact-signature and
+        # result-repetition trackers below: those key on the tool call's
+        # arguments or result content, both of which the model varies on
+        # every retry (a new URL slug guessed each time), so they never
+        # accumulate. This tracks failures by registrable host instead, so
+        # verywellfamily.com/oci-card-renewal -> /oci-renewal-guide ->
+        # /oci-renewal-process all count against the same bucket. Never
+        # raises: unparseable URLs/results simply contribute no observation.
+        try:
+            self._track_domain_failures(tool_name, args, result, failed)
+        except Exception:
+            pass
 
         # Result-repetition loop detection. This is deliberately independent of
         # the tool name, its argument signature, and whether the call "failed":
@@ -535,6 +584,31 @@ class ToolCallGuardrailController:
             return False
         return tool_name in self.config.idempotent_tools
 
+    def _track_domain_failures(
+        self,
+        tool_name: str,
+        args: Mapping[str, Any],
+        result: str | None,
+        failed: bool,
+    ) -> None:
+        """Update per-host failure counters for web-fetch-family tools.
+
+        A 2xx/3xx success for a host resets its counter; anything classified
+        as a failure (tool-level error, ``blocked: true``, or a parsed HTTP
+        ``status`` >= 400 — including the ``ok: true, status: 404`` shape
+        that other classifiers miss) increments it. The accumulated count is
+        read back in ``before_call`` to block further calls to that host.
+        """
+        if tool_name not in WEB_FETCH_TOOL_NAMES:
+            return
+        for host, is_failure in _web_fetch_domain_outcomes(tool_name, args, result, failed):
+            if not host:
+                continue
+            if is_failure:
+                self._domain_failure_counts[host] = self._domain_failure_counts.get(host, 0) + 1
+            else:
+                self._domain_failure_counts.pop(host, None)
+
 
 def toolguard_synthetic_result(decision: ToolGuardrailDecision) -> str:
     """Build a synthetic role=tool content string for a blocked tool call."""
@@ -581,6 +655,113 @@ def _tool_failure_recovery_hint(tool_name: str, count: int) -> str:
 
 def _coerce_args(args: Mapping[str, Any] | None) -> Mapping[str, Any]:
     return args if isinstance(args, Mapping) else {}
+
+
+def _registrable_host(url: Any) -> str | None:
+    """Lowercased netloc with the ``www.`` prefix stripped, or ``None``.
+
+    Deliberately simple (no public-suffix-list dependency): good enough to
+    bucket ``verywellfamily.com/oci-card-renewal`` and
+    ``verywellfamily.com/oci-renewal-guide-5215361`` together, which is all
+    this guard needs. Never raises — any malformed input yields ``None``.
+    """
+    if not url or not isinstance(url, str):
+        return None
+    try:
+        netloc = urlsplit(url).netloc
+        if not netloc:
+            return None
+        if "@" in netloc:
+            netloc = netloc.rsplit("@", 1)[-1]
+        host = netloc.split(":")[0].strip().lower()
+        if not host:
+            return None
+        if host.startswith("www."):
+            host = host[4:]
+        return host or None
+    except Exception:
+        return None
+
+
+def _urls_from_args(tool_name: str, args: Mapping[str, Any]) -> list[str]:
+    """Pull the URL(s) a web-fetch-family tool call was about to request."""
+    if tool_name == "web_extract":
+        raw = args.get("urls")
+        return [u for u in raw if isinstance(u, str)] if isinstance(raw, list) else []
+    single = args.get("url")
+    return [single] if isinstance(single, str) and single else []
+
+
+def _hosts_from_args(tool_name: str, args: Mapping[str, Any]) -> list[str]:
+    """Distinct registrable hosts a call would touch, in first-seen order."""
+    hosts: list[str] = []
+    for url in _urls_from_args(tool_name, args):
+        host = _registrable_host(url)
+        if host and host not in hosts:
+            hosts.append(host)
+    return hosts
+
+
+def _web_fetch_domain_outcomes(
+    tool_name: str,
+    args: Mapping[str, Any],
+    result: str | None,
+    failed: bool,
+) -> list[tuple[str, bool]]:
+    """Return ``(host, is_failure)`` pairs observed in a web-fetch tool result.
+
+    ``web_extract`` batches multiple URLs per call and reports a per-URL
+    ``error`` in its ``results`` list, so each entry is resolved against the
+    result payload (falling back to the request URLs on a parse failure —
+    those are then treated as failures only via the caller-supplied
+    ``failed`` flag, never fabricated). Single-URL tools (``fetch_resilient``,
+    ``browser_navigate``) resolve one host from the result's own ``url``/
+    ``final_url`` field, falling back to the request argument, and are a
+    failure if the caller already classified the call as failed, the payload
+    says ``blocked: true``, or a parsed ``status`` is >= 400 — the last of
+    these is the case a plain error/blocked check alone misses (``ok: true``
+    with ``status: 404``).
+    """
+    parsed = safe_json_loads(result or "")
+
+    if tool_name == "web_extract":
+        entries: list[tuple[str, bool]] = []
+        if isinstance(parsed, Mapping) and isinstance(parsed.get("results"), list):
+            for item in parsed["results"]:
+                if not isinstance(item, Mapping):
+                    continue
+                host = _registrable_host(item.get("url"))
+                if host:
+                    entries.append((host, bool(item.get("error"))))
+        if entries:
+            return entries
+        # Result didn't parse into the expected shape (e.g. a top-level
+        # error) — fall back to the requested hosts, tagged with whatever
+        # the caller already determined about the call as a whole.
+        return [(host, failed) for host in _hosts_from_args(tool_name, args)]
+
+    url = None
+    if isinstance(parsed, Mapping):
+        url = parsed.get("url") or parsed.get("final_url")
+    if not url:
+        candidates = _urls_from_args(tool_name, args)
+        url = candidates[0] if candidates else None
+    host = _registrable_host(url)
+    if not host:
+        return []
+
+    is_failure = bool(failed)
+    if not is_failure and isinstance(parsed, Mapping):
+        if parsed.get("blocked"):
+            is_failure = True
+        else:
+            status = parsed.get("status")
+            if status is not None:
+                try:
+                    is_failure = int(status) >= 400
+                except (TypeError, ValueError):
+                    pass
+    return [(host, is_failure)]
 
 
 def _normalize_assistant_text(content: str | None) -> str:
