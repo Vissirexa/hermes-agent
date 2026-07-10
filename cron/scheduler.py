@@ -2584,11 +2584,6 @@ def run_job(
 
     agent = None
 
-    # Mark this as a cron session so the approval system can apply cron_mode.
-    # This env var is process-wide and persists for the lifetime of the
-    # scheduler process — every job this process runs is a cron job.
-    os.environ["HERMES_CRON_SESSION"] = "1"
-
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
     from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
@@ -2626,6 +2621,15 @@ def run_job(
     )
     for _var_name in _cron_delivery_vars:
         _VAR_MAP[_var_name].set("")
+
+    # Mark this task as a cron session so the approval system applies
+    # cron_mode. Task-local on purpose: the in-process scheduler
+    # (gateway/run.py::_start_cron_ticker) shares its process with the live
+    # gateway, so the old process-wide os.environ flag reclassified every
+    # interactive session after the first tick as cron — hard-denying (or
+    # with cron_mode: approve, silently auto-approving) commands that should
+    # have gone through interactive gateway approval.
+    _VAR_MAP["HERMES_CRON_SESSION"].set("1")
 
     # Per-job working directory.  When set (and validated at create/update
     # time), we point TERMINAL_CWD at it so:

@@ -103,6 +103,12 @@ class TestRequestToolApproval:
     def test_cron_deny_mode_blocks(self, monkeypatch):
         monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
         monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        # Cron classification now goes through _is_cron_session(), which reads
+        # the HERMES_CRON_SESSION contextvar with an os.environ fallback (not
+        # env_var_enabled directly) — set the real env var to simulate a
+        # dedicated cron worker process. Keep env_var_enabled patched so other
+        # process-level flags (HERMES_EXEC_ASK, ...) stay off deterministically.
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
         monkeypatch.setattr(approval, "env_var_enabled",
                             lambda v: v == "HERMES_CRON_SESSION")
         monkeypatch.setattr(approval, "_get_cron_approval_mode", lambda: "deny")
@@ -113,6 +119,7 @@ class TestRequestToolApproval:
     def test_cron_approve_mode_allows(self, monkeypatch):
         monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
         monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
         monkeypatch.setattr(approval, "env_var_enabled",
                             lambda v: v == "HERMES_CRON_SESSION")
         monkeypatch.setattr(approval, "_get_cron_approval_mode", lambda: "approve")
