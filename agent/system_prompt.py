@@ -32,6 +32,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
+    CLARIFY_FIRST_GUIDANCE,
     DEFAULT_AGENT_IDENTITY,
     EXECUTION_GUIDANCE_MODELS,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
@@ -451,6 +452,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:
         tool_guidance.append(SKILLS_GUIDANCE)
+    # Clarify-first steer: nudges a single clarify call before committing to a
+    # guessed reading of an ungroundable acronym/shorthand that gates
+    # multi-step work (research, file creation, publishing). Only meaningful
+    # when clarify is actually callable — naming an unavailable tool induces
+    # hallucinated calls (see the web-fetch steer above for the same lesson).
+    if "clarify" in agent.valid_tool_names:
+        tool_guidance.append(CLARIFY_FIRST_GUIDANCE)
     # Kanban worker/orchestrator lifecycle — only present when the
     # dispatcher spawned this process (kanban_show check_fn gates on
     # HERMES_KANBAN_TASK env var). Normal chat sessions never see

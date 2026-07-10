@@ -238,6 +238,16 @@ SKILLS_GUIDANCE = (
     "4. **DEDUP** — After reloading a pruned skill, **ignore any remaining `[SKILL_PRUNED]` markers for that same skill** — they are historical artifacts from previous compactions and do not need further action."
 )
 
+CLARIFY_FIRST_GUIDANCE = (
+    "If a request hinges on an acronym, abbreviation, or shorthand term you "
+    "cannot confidently ground — especially one that gates multi-step work "
+    "like extensive research, creating files, or publishing — call clarify "
+    "once with your best interpretation as the first choice before starting. "
+    "A 30-second question is cheaper than a wrong deliverable: committing to "
+    "a guessed reading and then building several files or a published page "
+    "on top of it means redoing all of that work if the guess was wrong."
+)
+
 KANBAN_GUIDANCE = (
     "# Kanban task execution protocol\n"
     "You have been assigned ONE task from "
