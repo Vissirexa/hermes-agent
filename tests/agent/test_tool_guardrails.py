@@ -395,3 +395,236 @@ def test_repeated_multimodal_result_distinct_images_is_progress():
         )
         assert d.action == "allow"
     assert controller.halt_decision is None
+
+
+# ── Per-domain failure budget ────────────────────────────────────────────
+#
+# Real session evidence: with no web_search available, the model fabricates
+# URLs on a host that doesn't have the page, and evades the exact-signature
+# and result-repetition guards above by mutating the slug on every retry
+# (verywellfamily.com/oci-card-renewal -> /oci-renewal-guide ->
+# /oci-renewal-process -> /oci-card-renewal-5215361 -> ...). One session made
+# 95 fetch_resilient calls this way: 34 HTTP 404, 16 blocked — all with
+# "ok": true in the payload, so a guard that only looks at tool-level errors
+# never sees them. These tests key on registrable host instead of args/result
+# content.
+
+
+def _fetch_result(url: str, *, status: int = 200, ok: bool = True, blocked: bool = False) -> str:
+    """Shape returned by tools.resilient_fetch_tool.resilient_fetch."""
+    return json.dumps({"ok": ok, "url": url, "status": status, "blocked": blocked, "text": "x" * 50})
+
+
+def test_domain_failure_budget_blocks_after_six_slug_mutated_404s_but_not_other_host():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, domain_failure_budget=6)
+    )
+    host = "verywellfamily.com"
+    slugs = [
+        "oci-card-renewal",
+        "oci-renewal-guide",
+        "oci-renewal-process",
+        "oci-card-renewal-5215361",
+        "oci-renewal-checklist",
+        "oci-renewal-faq",
+    ]
+
+    for slug in slugs:
+        url = f"https://{host}/{slug}"
+        assert controller.before_call("fetch_resilient", {"url": url}).action == "allow"
+        # fetch_resilient reports ok=true even for a 404 (only bot-blocks set
+        # blocked=true), and the caller-computed `failed` flag mirrors that —
+        # this is exactly the shape a naive error-only guard would miss.
+        decision = controller.after_call(
+            "fetch_resilient",
+            {"url": url},
+            _fetch_result(url, status=404, ok=True, blocked=False),
+            failed=False,
+        )
+        assert decision.action == "allow"
+
+    blocked = controller.before_call(
+        "fetch_resilient", {"url": f"https://{host}/oci-renewal-final-answer"}
+    )
+    assert blocked.action == "block"
+    assert blocked.code == "domain_failure_budget_block"
+    assert host in blocked.message
+    assert blocked.count == 6
+    assert controller.halt_decision is blocked
+
+    # A different host must be entirely unaffected.
+    other = controller.before_call(
+        "fetch_resilient", {"url": "https://irs.gov/oci-renewal-info"}
+    )
+    assert other.action == "allow"
+
+
+def test_domain_failure_budget_success_resets_the_host_counter():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, domain_failure_budget=6)
+    )
+    host = "example.com"
+
+    for i in range(5):
+        url = f"https://{host}/path-{i}"
+        controller.after_call(
+            "fetch_resilient", {"url": url}, _fetch_result(url, status=404), failed=False
+        )
+    assert controller.before_call("fetch_resilient", {"url": f"https://{host}/x"}).action == "allow"
+
+    # A 200 resets the streak.
+    ok_url = f"https://{host}/works"
+    controller.after_call(
+        "fetch_resilient", {"url": ok_url}, _fetch_result(ok_url, status=200), failed=False
+    )
+
+    # 5 more failures after the reset must NOT reach the budget of 6.
+    for i in range(5):
+        url = f"https://{host}/retry-{i}"
+        controller.after_call(
+            "fetch_resilient", {"url": url}, _fetch_result(url, status=404), failed=False
+        )
+    assert controller.before_call("fetch_resilient", {"url": f"https://{host}/one-more"}).action == "allow"
+
+    # The 6th failure since the reset crosses the budget again.
+    final_url = f"https://{host}/retry-final"
+    controller.after_call(
+        "fetch_resilient", {"url": final_url}, _fetch_result(final_url, status=404), failed=False
+    )
+    blocked = controller.before_call("fetch_resilient", {"url": f"https://{host}/blocked-now"})
+    assert blocked.action == "block"
+    assert blocked.count == 6
+
+
+def test_domain_failure_budget_counts_blocked_and_error_and_http_404_shapes_together():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, domain_failure_budget=3)
+    )
+    host = "paywalled-news.example"
+
+    # Shape 1: bot-detection block (blocked: true, ok: false).
+    controller.after_call(
+        "fetch_resilient",
+        {"url": f"https://{host}/a"},
+        json.dumps({"ok": False, "url": f"https://{host}/a", "status": None, "blocked": True}),
+        failed=False,
+    )
+    # Shape 2: tool-level error, classified failed=True by the caller.
+    controller.after_call(
+        "fetch_resilient", {"url": f"https://{host}/b"}, '{"error":"timeout"}', failed=True
+    )
+    # Shape 3: ok: true + status 404 — the guard's core target.
+    controller.after_call(
+        "fetch_resilient",
+        {"url": f"https://{host}/c"},
+        _fetch_result(f"https://{host}/c", status=404, ok=True, blocked=False),
+        failed=False,
+    )
+
+    blocked = controller.before_call("fetch_resilient", {"url": f"https://{host}/d"})
+    assert blocked.action == "block"
+    assert blocked.count == 3
+
+
+def test_domain_failure_budget_config_override_via_hard_stop_after_mapping():
+    cfg = ToolCallGuardrailConfig.from_mapping(
+        {"hard_stop_enabled": True, "hard_stop_after": {"domain_failure": 2}}
+    )
+    assert cfg.domain_failure_budget == 2
+
+    controller = ToolCallGuardrailController(cfg)
+    host = "example.org"
+    for i in range(2):
+        url = f"https://{host}/x{i}"
+        controller.after_call(
+            "fetch_resilient", {"url": url}, _fetch_result(url, status=500), failed=False
+        )
+
+    blocked = controller.before_call("fetch_resilient", {"url": f"https://{host}/x2"})
+    assert blocked.action == "block"
+    assert blocked.count == 2
+
+
+def test_domain_failure_budget_covers_web_extract_batch_per_url_results():
+    """web_extract batches up to 5 URLs per call; each result entry carries
+    its own `error`, so a single call can touch/fail multiple hosts."""
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, domain_failure_budget=2)
+    )
+    host = "blocked-docs.example"
+    other_host = "fine-docs.example"
+
+    payload = json.dumps(
+        {
+            "results": [
+                {"url": f"https://{host}/one", "error": "404 Not Found"},
+                {"url": f"https://{other_host}/one", "error": None, "content": "ok"},
+            ]
+        }
+    )
+    controller.after_call(
+        "web_extract",
+        {"urls": [f"https://{host}/one", f"https://{other_host}/one"]},
+        payload,
+        failed=False,
+    )
+    payload2 = json.dumps({"results": [{"url": f"https://{host}/two", "error": "404 Not Found"}]})
+    controller.after_call("web_extract", {"urls": [f"https://{host}/two"]}, payload2, failed=False)
+
+    blocked = controller.before_call("web_extract", {"urls": [f"https://{host}/three"]})
+    assert blocked.action == "block"
+    assert blocked.tool_name == "web_extract"
+
+    assert controller.before_call(
+        "web_extract", {"urls": [f"https://{other_host}/two"]}
+    ).action == "allow"
+
+
+def test_domain_failure_budget_covers_browser_navigate_without_url_in_result():
+    """browser_navigate's failure payload has no `url` field at all
+    (`{"success": false, "error": ...}`) — the host must fall back to args."""
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, domain_failure_budget=2)
+    )
+    host = "flaky-site.example"
+    fail_payload = json.dumps({"success": False, "error": "Navigation failed"})
+
+    controller.after_call("browser_navigate", {"url": f"https://{host}/a"}, fail_payload, failed=True)
+    controller.after_call("browser_navigate", {"url": f"https://{host}/b"}, fail_payload, failed=True)
+
+    blocked = controller.before_call("browser_navigate", {"url": f"https://{host}/c"})
+    assert blocked.action == "block"
+
+
+def test_domain_failure_budget_ignores_non_web_fetch_tools():
+    # Other thresholds pinned high so only the domain-failure budget itself
+    # (deliberately set to 1) is under test — terminal isn't a web-fetch tool
+    # so it must still be allowed after 5 identical failures.
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            domain_failure_budget=1,
+            exact_failure_block_after=99,
+            same_tool_failure_halt_after=99,
+        )
+    )
+    for _ in range(5):
+        controller.after_call(
+            "terminal", {"command": "curl https://example.com/x"}, '{"exit_code":1}', failed=True
+        )
+    assert controller.before_call(
+        "terminal", {"command": "curl https://example.com/x"}
+    ).action == "allow"
+
+
+def test_domain_failure_budget_fails_open_on_malformed_urls_and_results():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, domain_failure_budget=1)
+    )
+    # None URL, non-JSON result, missing args entirely — must never raise.
+    controller.after_call("fetch_resilient", {"url": None}, "not json at all", failed=True)
+    assert controller.before_call("fetch_resilient", {"url": "::not-a-url::"}).action == "allow"
+    controller.after_call("fetch_resilient", {}, None, failed=False)
+    assert controller.before_call("fetch_resilient", {}).action == "allow"
+    controller.after_call("web_extract", {"urls": "not-a-list"}, "{}", failed=False)
+    assert controller.before_call("web_extract", {"urls": "not-a-list"}).action == "allow"
