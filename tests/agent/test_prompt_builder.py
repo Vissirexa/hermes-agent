@@ -31,6 +31,7 @@ from agent.prompt_builder import (
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
+    CLARIFY_FIRST_GUIDANCE,
     PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
 )
@@ -53,6 +54,11 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+    def test_clarify_first_guidance_names_the_tool_and_the_trigger(self):
+        assert "call clarify" in CLARIFY_FIRST_GUIDANCE
+        assert "acronym" in CLARIFY_FIRST_GUIDANCE
+        assert "before starting" in CLARIFY_FIRST_GUIDANCE
 
 
 # =========================================================================
