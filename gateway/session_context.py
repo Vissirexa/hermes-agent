@@ -120,6 +120,17 @@ _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_P
 _CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
 
+# Whether the current task is executing a scheduled cron job. Set per-job in
+# run_job() — NOT via os.environ, which is process-global: the in-process
+# scheduler (gateway/run.py::_start_cron_ticker) shares its process with the
+# live gateway, so a process-wide flag set by the first cron tick would
+# reclassify every subsequent interactive session as cron and route its
+# approvals through ``approvals.cron_mode`` (hard-deny or, worse,
+# auto-approve) instead of the interactive gateway approval flow. The
+# ``os.environ`` fallback in get_session_env still honors a process-level
+# HERMES_CRON_SESSION for dedicated cron worker processes and tests.
+_CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
+
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
     "HERMES_SESSION_SOURCE": _SESSION_SOURCE,
@@ -136,6 +147,7 @@ _VAR_MAP = {
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
+    "HERMES_CRON_SESSION": _CRON_SESSION,
 }
 
 
