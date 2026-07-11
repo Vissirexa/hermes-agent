@@ -358,6 +358,24 @@ CONVERGENCE_GUIDANCE = (
     "then resume from the last known good state."
 )
 
+# Research-is-read-only steer — addresses eager-mutation on research asks:
+# asked to "research provider profiles and write the findings to MD files",
+# the model instead started editing the live config and creating a new
+# profile (had to be manually stopped). "Research X" plus available write
+# tools gets misread as "set up X". Applied to ALL models; short because it
+# lives in the cached system prompt.
+RESEARCH_READ_ONLY_GUIDANCE = (
+    "# Research tasks are read-only\n"
+    "When the user asks you to research, investigate, analyze, audit, compare, "
+    "or write up findings about something, the deliverable is a document or "
+    "answer — not a change to the system. Do not modify configuration files, "
+    "create or edit profiles, install packages, or otherwise mutate state as "
+    "part of a research task. Writing the requested notes/report files is "
+    "fine; changing the thing you were asked to research is not. If acting on "
+    "the findings seems useful, finish the research deliverable first, then "
+    "propose the change and wait for the user to ask for it."
+)
+
 # Web-fetch steer — addresses the bot-block loop: the model hand-rolled raw
 # HTTP requests in execute_code (no browser fingerprint) against Cloudflare-
 # protected sites, got 403/404/challenge pages, and looped (e.g. levels.fyi).

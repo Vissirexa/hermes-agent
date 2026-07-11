@@ -116,3 +116,22 @@ class TestClarifyFirstSteer:
     def test_absent_with_no_tools(self):
         agent = _make_agent(valid_tool_names=[])
         assert "call clarify" not in _stable_prompt(agent)
+
+
+class TestResearchReadOnlySteer:
+    """Research-is-read-only steer: on by default when tools are loaded,
+    off via config gate or when the agent has no tools (nothing to steer)."""
+
+    def test_present_by_default_with_tools(self):
+        agent = _make_agent(valid_tool_names=["read_file"])
+        assert "Research tasks are read-only" in _stable_prompt(agent)
+
+    def test_absent_when_gated_off(self):
+        agent = _make_agent(
+            valid_tool_names=["read_file"], _research_read_only_guidance=False
+        )
+        assert "Research tasks are read-only" not in _stable_prompt(agent)
+
+    def test_absent_with_no_tools(self):
+        agent = _make_agent(valid_tool_names=[])
+        assert "Research tasks are read-only" not in _stable_prompt(agent)

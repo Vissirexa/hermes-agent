@@ -1459,6 +1459,12 @@ def init_agent(
     # it targets a different failure mode (analysis loops vs. premature stop).
     agent._convergence_guidance = bool(_agent_section.get("convergence_guidance", True))
 
+    # Research-is-read-only guidance toggle.  Default True.  Steers the model
+    # to treat research/investigate/write-up asks as read-only deliverables
+    # instead of mutating config or creating profiles it was asked to study.
+    # Separate flag: targets eager mutation, not premature stop or loops.
+    agent._research_read_only_guidance = bool(_agent_section.get("research_read_only_guidance", True))
+
     # Local Python toolchain probe toggle.  Default True.  When False,
     # the probe is skipped entirely (no subprocess calls, no system-prompt
     # line).  Useful for users on exotic setups where the probe heuristics

@@ -44,6 +44,7 @@ from agent.prompt_builder import (
     build_web_fetch_guidance,
     TOOL_USE_ENFORCEMENT_MODELS,
     CONVERGENCE_GUIDANCE,
+    RESEARCH_READ_ONLY_GUIDANCE,
     drain_truncation_warnings,
 )
 from agent.runtime_cwd import resolve_context_cwd
@@ -181,6 +182,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # config.yaml ``agent.convergence_guidance`` (default True).
     if getattr(agent, "_convergence_guidance", True) and agent.valid_tool_names:
         stable_parts.append(CONVERGENCE_GUIDANCE)
+
+    # Research-is-read-only steer — research/investigate/write-up asks must
+    # not mutate config or create profiles (observed: a "research provider
+    # profiles" ask turned into live config edits).  Applied to ALL models;
+    # gated by config.yaml ``agent.research_read_only_guidance`` (default True).
+    if getattr(agent, "_research_read_only_guidance", True) and agent.valid_tool_names:
+        stable_parts.append(RESEARCH_READ_ONLY_GUIDANCE)
 
     # Web-fetch steer: use the browser/web tools (real fingerprint) instead of
     # raw HTTP in execute_code, and switch sources instead of looping when
