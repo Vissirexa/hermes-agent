@@ -2628,8 +2628,11 @@ def run_job(
     # gateway, so the old process-wide os.environ flag reclassified every
     # interactive session after the first tick as cron — hard-denying (or
     # with cron_mode: approve, silently auto-approving) commands that should
-    # have gone through interactive gateway approval.
-    _VAR_MAP["HERMES_CRON_SESSION"].set("1")
+    # have gone through interactive gateway approval. Keep the token and
+    # reset() in the finally below — setting "" instead would be treated as
+    # an authoritative (explicit) value by get_session_env() and suppress
+    # the os.environ fallback for dedicated cron worker processes.
+    _cron_session_token = _VAR_MAP["HERMES_CRON_SESSION"].set("1")
 
     # Per-job working directory.  When set (and validated at create/update
     # time), we point TERMINAL_CWD at it so:
@@ -3191,6 +3194,7 @@ def run_job(
             _terminal_cwd_lock.release_read()
         # Clean up ContextVar session/delivery state for this job.
         clear_session_vars(_ctx_tokens)
+        _VAR_MAP["HERMES_CRON_SESSION"].reset(_cron_session_token)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
         if _session_db:

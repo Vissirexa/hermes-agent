@@ -192,7 +192,9 @@ def _is_cron_session() -> bool:
 
         return is_truthy_value(get_session_env("HERMES_CRON_SESSION", ""))
     except Exception:
-        return _is_cron_session()
+        # Legacy fallback when the session_context import/read fails:
+        # consult the process env directly (never recurse into this helper).
+        return is_truthy_value(os.getenv("HERMES_CRON_SESSION", ""))
 
 
 def _is_gateway_approval_context() -> bool:

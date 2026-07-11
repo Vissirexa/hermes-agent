@@ -524,6 +524,21 @@ class TestCronSessionContextVar:
         monkeypatch.setenv("HERMES_CRON_SESSION", "1")
         assert _is_cron_session() is True
 
+    def test_fallback_reads_process_env_without_recursion(self, monkeypatch):
+        """If the session_context read fails, _is_cron_session() must consult
+        os.environ directly. An earlier version of the helper recursed into
+        itself in the except block, turning any import/read failure into a
+        RecursionError instead of the documented legacy fallback."""
+        from unittest.mock import patch as mock_patch
+
+        with mock_patch(
+            "gateway.session_context.get_session_env",
+            side_effect=RuntimeError("session context unavailable"),
+        ):
+            assert _is_cron_session() is False
+            monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+            assert _is_cron_session() is True
+
     def test_reset_session_vars_returns_to_unset_then_env_fallback_reapplies(self, monkeypatch):
         _VAR_MAP["HERMES_CRON_SESSION"].set("1")
         assert _is_cron_session() is True
@@ -576,3 +591,102 @@ class TestCronSessionContextVar:
 
         interactive_ctx = contextvars.copy_context()
         interactive_ctx.run(_interactive_body)
+
+
+class TestRunJobCronMarkerLifecycle:
+    """Real run_job() lifecycle for the HERMES_CRON_SESSION marker.
+
+    The marker must be bound for the duration of the job (so cron_mode
+    applies inside it) and token-reset in run_job's finally: leaving it set
+    would misclassify later work on the scheduler thread's ambient context,
+    while resetting via ``.set("")`` would be just as wrong — an explicit
+    empty value is authoritative for get_session_env() and would suppress
+    the os.environ fallback that dedicated cron worker processes rely on.
+    Mock harness mirrors tests/cron/test_cron_provider_pin.py.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_marker_state(self, monkeypatch):
+        _VAR_MAP["HERMES_CRON_SESSION"].set(_UNSET)
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        yield
+        _VAR_MAP["HERMES_CRON_SESSION"].set(_UNSET)
+
+    def test_marker_bound_during_job_and_token_reset_after(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock, patch as mock_patch
+
+        from cron.scheduler import run_job
+
+        seen = {}
+
+        def _record_marker(*args, **kwargs):
+            # Runs inside run_job, standing in for the agent turn: the job
+            # itself must classify as cron so cron_mode applies to it.
+            seen["is_cron"] = _is_cron_session()
+            seen["env_written"] = "HERMES_CRON_SESSION" in os.environ
+            return {"final_response": "ok"}
+
+        job = {
+            "id": "marker-lifecycle-test",
+            "name": "marker lifecycle test",
+            "prompt": "hello",
+            "model": "test-model",
+            "provider": None,
+            "provider_snapshot": "openrouter",
+            "base_url": None,
+        }
+
+        def _job_body():
+            # run_job also clear_session_vars()-clears the HERMES_SESSION_*
+            # contextvars to explicit "" on exit (documented semantics, not
+            # under test here), so drive it in a copied Context — like the
+            # scheduler's own thread — to keep this test's ambient context
+            # clean for whatever test runs next.
+            success, _output, _final, error = run_job(job)
+            seen["success"] = success
+            seen["error"] = error
+            # Still inside the job's context, after run_job returned: the
+            # marker must be token-reset back to the "never set" sentinel —
+            # not left at "1", and not overwritten with an authoritative "".
+            seen["marker_after"] = _VAR_MAP["HERMES_CRON_SESSION"].get()
+
+        fake_db = MagicMock()
+        with mock_patch("cron.scheduler._hermes_home", tmp_path), \
+             mock_patch("cron.scheduler._resolve_origin", return_value=None), \
+             mock_patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             mock_patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             mock_patch("hermes_state.SessionDB", return_value=fake_db), \
+             mock_patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             mock_patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.side_effect = _record_marker
+            mock_agent_cls.return_value = mock_agent
+
+            contextvars.copy_context().run(_job_body)
+
+        assert seen["success"] is True
+        assert seen["error"] is None
+
+        # Inside the job: classified as cron, without touching os.environ.
+        assert seen["is_cron"] is True
+        assert seen["env_written"] is False
+
+        # After completion, in the job's own context: reset to _UNSET.
+        assert seen["marker_after"] is _UNSET
+        assert "HERMES_CRON_SESSION" not in os.environ
+
+        # And in the spawning context the os.environ fallback still works —
+        # a ".set(\"\")"-style reset inside run_job's context could never
+        # shadow it out here, and the marker itself never escaped.
+        assert _VAR_MAP["HERMES_CRON_SESSION"].get() is _UNSET
+        assert _is_cron_session() is False
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        assert _is_cron_session() is True
