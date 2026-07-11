@@ -645,6 +645,19 @@ DANGEROUS_PATTERNS = [
     # profile flag can't slip the agent past the guard.
     (r'\bhermes\s+(?:-{1,2}\S+(?:\s+\S+)?\s+)*gateway\s+(stop|restart)\b', "stop/restart hermes gateway (kills running agents)"),
     (r'\bhermes\s+update\b', "hermes update (restarts gateway, kills running agents)"),
+    # Hermes self-configuration protection.  The file tools already refuse
+    # writes to ~/.hermes/config.yaml (_check_sensitive_path), but the
+    # terminal tool was an open side door: `hermes config set` rewrites the
+    # same security-sensitive file (approvals.mode lives there), and
+    # `hermes profile create/delete/use/...` mutates profile state — observed
+    # when a "research the provider profiles" ask turned into live config
+    # edits and a half-created profile.  Read-only verbs (config show/get,
+    # profile list/show/info/export, and bare `hermes profile`) stay
+    # unguarded — KANBAN_GUIDANCE tells orchestrators to run `hermes profile
+    # list`.  Allow global flags between `hermes` and the subcommand, same
+    # rationale as the gateway pattern above.
+    (r'\bhermes\s+(?:-{1,2}\S+(?:\s+\S+)?\s+)*config\s+set\b', "modify hermes config via CLI (security settings live here)"),
+    (r'\bhermes\s+(?:-{1,2}\S+(?:\s+\S+)?\s+)*profile\s+(create|delete|use|rename|import|install|update)\b', "create/modify/delete hermes profile"),
     # Docker container lifecycle — any user with docker.sock mounted (a common
     # Docker Compose pattern) gives the agent the ability to restart/stop/kill
     # containers without approval.  These are agent-initiated lifecycle operations

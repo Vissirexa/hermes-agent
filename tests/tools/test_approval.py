@@ -1160,6 +1160,70 @@ class TestGatewayProtection:
         assert dangerous is True
         assert "self-termination" in desc
 
+
+class TestHermesSelfConfigProtection:
+    """`hermes config set` and profile mutation route through approval.
+
+    The file tools already refuse writes to ~/.hermes/config.yaml; these
+    patterns close the terminal-tool side door (a research ask turned into
+    live config edits and a half-created profile)."""
+
+    def test_hermes_config_set_detected(self):
+        cmd = "hermes config set approvals.mode off"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "config" in desc.lower()
+
+    def test_hermes_config_set_with_profile_flag_detected(self):
+        cmd = "hermes -p ade config set agent.model gpt-5"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_hermes_config_show_not_flagged(self):
+        cmd = "hermes config"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_hermes_profile_create_detected(self):
+        cmd = "hermes profile create research-bot"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "profile" in desc.lower()
+
+    def test_hermes_profile_delete_detected(self):
+        cmd = "hermes profile delete old-profile"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_hermes_profile_use_detected(self):
+        """`use` flips the sticky default profile — a state mutation."""
+        cmd = "hermes profile use ade"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_hermes_profile_install_detected(self):
+        """`install` pulls and applies a remote distribution."""
+        cmd = "hermes profile install https://github.com/x/dist.git"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_hermes_profile_list_not_flagged(self):
+        """KANBAN_GUIDANCE tells orchestrators to run `hermes profile list`."""
+        cmd = "hermes profile list"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_hermes_profile_show_not_flagged(self):
+        cmd = "hermes profile show ade"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_bare_hermes_profile_not_flagged(self):
+        """Bare `hermes profile` just prints the active profile name."""
+        cmd = "hermes profile"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is False
+
     def test_pkill_gateway_detected(self):
         cmd = "pkill -f gateway"
         dangerous, key, desc = detect_dangerous_command(cmd)
