@@ -118,3 +118,35 @@ def test_delta_baseline_capped(monkeypatch):
         assert "/tmp/file0.py" not in svc._delta_baseline
     finally:
         svc.shutdown()
+
+
+def test_delta_baseline_refreshes_recency_on_rewrite(monkeypatch):
+    """A path rewritten every edit must not age out ahead of paths never
+    touched again — _set_delta_baseline moves the rewritten path to the recent
+    end so eviction reflects actual write recency (PR #62934 review follow-up)."""
+    import agent.lsp.manager as manager_mod
+    from agent.lsp.manager import LSPService
+
+    monkeypatch.setattr(manager_mod, "_DELTA_BASELINE_CAP", 3)
+    svc = LSPService(
+        enabled=False,
+        wait_mode="document",
+        wait_timeout=2.0,
+        install_strategy="auto",
+    )
+    try:
+        svc._set_delta_baseline("/tmp/a.py", [{"m": "a"}])
+        svc._set_delta_baseline("/tmp/b.py", [{"m": "b"}])
+        svc._set_delta_baseline("/tmp/c.py", [{"m": "c"}])
+        # Re-write the oldest path: it should jump to the most-recent end and
+        # carry the new value.
+        svc._set_delta_baseline("/tmp/a.py", [{"m": "a2"}])
+        assert list(svc._delta_baseline) == ["/tmp/b.py", "/tmp/c.py", "/tmp/a.py"]
+        assert svc._delta_baseline["/tmp/a.py"] == [{"m": "a2"}]
+        # The next insert evicts b (now genuinely oldest), NOT the rewritten a.
+        svc._set_delta_baseline("/tmp/d.py", [{"m": "d"}])
+        assert "/tmp/b.py" not in svc._delta_baseline
+        assert "/tmp/a.py" in svc._delta_baseline
+        assert set(svc._delta_baseline) == {"/tmp/c.py", "/tmp/a.py", "/tmp/d.py"}
+    finally:
+        svc.shutdown()
