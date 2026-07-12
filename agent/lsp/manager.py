@@ -196,6 +196,19 @@ class LSPService:
         while len(self._delta_baseline) > _DELTA_BASELINE_CAP:
             self._delta_baseline.pop(next(iter(self._delta_baseline)), None)
 
+    def _set_delta_baseline(self, abs_path: str, diags: List[Dict[str, Any]]) -> None:
+        """Store a baseline for ``abs_path``, refreshing its recency.
+
+        The dict is insertion-ordered and evicted oldest-first, but a plain
+        reassignment keeps an existing key in its original slot — so a path
+        rewritten every edit would still age out ahead of paths never touched
+        again.  Pop-then-set moves the just-written path to the most-recent
+        end, so eviction reflects actual write recency.
+        """
+        self._delta_baseline.pop(abs_path, None)
+        self._delta_baseline[abs_path] = diags
+        self._cap_delta_baseline()
+
     @classmethod
     def create_from_config(cls) -> Optional["LSPService"]:
         """Build a service from ``hermes_cli.config`` settings.
@@ -306,12 +319,11 @@ class LSPService:
             return
         try:
             diags = self._loop.run(self._snapshot_async(file_path), timeout=8.0)
-            self._delta_baseline[os.path.abspath(file_path)] = diags or []
+            self._set_delta_baseline(os.path.abspath(file_path), diags or [])
         except Exception as e:  # noqa: BLE001
             logger.debug("baseline snapshot failed for %s: %s", file_path, e)
             self._mark_broken_for_file(file_path, e)
-            self._delta_baseline[os.path.abspath(file_path)] = []
-        self._cap_delta_baseline()
+            self._set_delta_baseline(os.path.abspath(file_path), [])
 
     def get_diagnostics_sync(
         self,
@@ -389,8 +401,7 @@ class LSPService:
             except Exception:  # noqa: BLE001
                 fresh = []
             if fresh:
-                self._delta_baseline[abs_path] = fresh
-                self._cap_delta_baseline()
+                self._set_delta_baseline(abs_path, fresh)
 
         if diags:
             eventlog.log_diagnostics(server_id, file_path, len(diags))
