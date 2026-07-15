@@ -580,6 +580,11 @@ def init_agent(
     agent._tool_guardrails = ToolCallGuardrailController()
     agent._tool_guardrail_halt_decision: ToolGuardrailDecision | None = None
     agent._pending_narration_warning: ToolGuardrailDecision | None = None
+    # One tool-free wrap-up API call after a guardrail halt (see the halt
+    # branch in conversation_loop). All three are per-turn state.
+    agent._toolguard_wrapup_requested = False
+    agent._suppress_tools_for_next_call = False
+    agent._toolguard_last_halt_decision: ToolGuardrailDecision | None = None
 
     # Interrupt mechanism for breaking out of tool loops
     agent._interrupt_requested = False

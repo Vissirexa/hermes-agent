@@ -777,6 +777,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
 def build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     tools_for_api = agent.tools
+    # One-shot suppression set by the guardrail-halt wrap-up path in
+    # conversation_loop: the next API call must not offer tools so the model
+    # writes a final summary instead of resuming the halted loop. Consumed
+    # immediately so the following call re-arms tools normally.
+    if getattr(agent, "_suppress_tools_for_next_call", False):
+        agent._suppress_tools_for_next_call = False
+        tools_for_api = None
 
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()

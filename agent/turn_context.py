@@ -233,6 +233,9 @@ def build_turn_context(
     agent._unicode_sanitization_passes = 0
     agent._tool_guardrails.reset_for_turn()
     agent._tool_guardrail_halt_decision = None
+    agent._toolguard_last_halt_decision = None
+    agent._toolguard_wrapup_requested = False
+    agent._suppress_tools_for_next_call = False
     _reset_consol = getattr(agent._memory_store, "reset_consolidation_failures", None)
     if callable(_reset_consol):
         _reset_consol()

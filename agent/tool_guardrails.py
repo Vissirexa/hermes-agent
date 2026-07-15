@@ -58,6 +58,10 @@ MUTATING_TOOL_NAMES = frozenset(
         "browser_click",
         "browser_type",
         "browser_press",
+        # browser_wait mutates no DOM itself, but it advances page state by
+        # letting timers/network settle — the whole point of calling it is
+        # that the next read may differ, so it must reset no-progress counts.
+        "browser_wait",
         "browser_scroll",
         "browser_navigate",
         "send_message",
@@ -440,6 +444,17 @@ class ToolCallGuardrailController:
 
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
+
+        # A successful state-changing call invalidates "same result = no
+        # progress" for every idempotent signature: the world just changed,
+        # so re-reading is legitimate even if the read comes back identical
+        # a first time (slow SPAs often lag one interaction behind). Without
+        # this, a browser session interleaving click/type/press with
+        # browser_snapshot accumulates snapshot repeats across the whole
+        # turn and hard-blocks the model's only way to observe the page.
+        # Tight read-read-read loops with nothing in between still count.
+        if tool_name in self.config.mutating_tools:
+            self._no_progress.clear()
 
         if not self._is_idempotent(tool_name):
             self._no_progress.pop(signature, None)

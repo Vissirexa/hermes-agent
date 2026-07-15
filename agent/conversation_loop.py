@@ -4800,6 +4800,40 @@ def run_conversation(
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
+                    if not getattr(agent, "_toolguard_wrapup_requested", False):
+                        # Give the model one tool-free wrap-up call before
+                        # ending the turn. A halt used to fabricate a fixed
+                        # "I stopped retrying X" string as the final answer,
+                        # which discards everything the model actually
+                        # observed (partial results, the concrete blocker).
+                        # Suppressing tools for exactly one API call bounds
+                        # the loop just as hard while letting the model write
+                        # a real summary. If a halt fires again after the
+                        # wrap-up call, fall through to the canned response.
+                        agent._toolguard_wrapup_requested = True
+                        # Clearing the halt lets the loop run the wrap-up
+                        # call; keep the decision for turn-result metadata.
+                        agent._toolguard_last_halt_decision = decision
+                        agent._tool_guardrail_halt_decision = None
+                        agent._suppress_tools_for_next_call = True
+                        agent._emit_status(
+                            f"⚠️ Tool guardrail halted {decision.tool_name}: "
+                            f"{decision.code} — requesting a final summary"
+                        )
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "[Tool-loop guardrail] Further tool calls were "
+                                f"stopped ({decision.code} on {decision.tool_name}: "
+                                f"{decision.message}) Do not attempt more tool "
+                                "calls. Write your final reply to the user now: "
+                                "what you were trying to do, what you actually "
+                                "observed or accomplished so far (include any "
+                                "concrete partial results), what blocked you, and "
+                                "the most useful next step or question for the user."
+                            ),
+                        })
+                        continue
                     _turn_exit_reason = "guardrail_halt"
                     final_response = agent._toolguard_controlled_halt_response(decision)
                     agent._emit_status(

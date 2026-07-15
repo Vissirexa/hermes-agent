@@ -290,7 +290,9 @@ def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_
         result = agent.run_conversation("search repeatedly")
 
     assert mock_hfc.call_count == 2
-    assert result["api_calls"] == 3
+    # 3 calls reach the first halt; the wrap-up call (which this stub
+    # "model" answers with yet another blocked tool call) makes it 4.
+    assert result["api_calls"] == 4
     assert result["api_calls"] < agent.max_iterations
     assert result["turn_exit_reason"] == "guardrail_halt"
     assert "error" not in result
@@ -353,3 +355,90 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     assert halt_text in text_deltas, (
         f"halt message was never streamed; callback only saw {deltas!r}"
     )
+
+
+def test_guardrail_halt_grants_one_toolless_wrapup_call_and_uses_its_text():
+    """After a halt the model gets one tool-free call to write a real summary.
+
+    The wrap-up request must not offer tools, must carry the guardrail steer
+    as a user message, and its text answer becomes the final response instead
+    of the canned "I stopped retrying" string. The halt metadata survives in
+    the turn result even though the live halt decision was cleared.
+    """
+    agent = _make_agent("web_search", max_iterations=10, config=_hard_stop_config())
+    same_args = {"query": "same"}
+    responses = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("web_search", json.dumps(same_args), f"c{i}")],
+        )
+        for i in range(1, 4)
+    ] + [
+        _mock_response(
+            content="I found two prices before the search stalled: $743 and $802.",
+            finish_reason="stop",
+        )
+    ]
+    agent.client.chat.completions.create.side_effect = responses
+
+    with (
+        patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})) as mock_hfc,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("search repeatedly")
+
+    assert mock_hfc.call_count == 2  # third call blocked, fourth is tool-free
+    assert result["api_calls"] == 4
+    assert result["completed"] is True
+    assert result["final_response"] == (
+        "I found two prices before the search stalled: $743 and $802."
+    )
+    assert "stopped retrying" not in result["final_response"]
+    # Halt metadata is preserved for callers even on the wrap-up path.
+    assert result["guardrail"]["code"] == "repeated_exact_failure_block"
+    assert result["guardrail"]["tool_name"] == "web_search"
+
+    # The wrap-up API request offered no tools.
+    wrapup_kwargs = agent.client.chat.completions.create.call_args_list[-1].kwargs
+    assert not wrapup_kwargs.get("tools")
+    # Every earlier request offered the tool schema.
+    for earlier in agent.client.chat.completions.create.call_args_list[:-1]:
+        assert earlier.kwargs.get("tools")
+
+    # The guardrail steer landed as a user message before the wrap-up call.
+    steers = [
+        m for m in result["messages"]
+        if m.get("role") == "user" and "[Tool-loop guardrail]" in (m.get("content") or "")
+    ]
+    assert len(steers) == 1
+
+
+def test_wrapup_is_granted_only_once_per_turn():
+    """A model that keeps looping after the wrap-up gets the canned halt."""
+    agent = _make_agent("web_search", max_iterations=10, config=_hard_stop_config())
+    same_args = {"query": "same"}
+    responses = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("web_search", json.dumps(same_args), f"c{i}")],
+        )
+        for i in range(1, 10)
+    ]
+    agent.client.chat.completions.create.side_effect = responses
+
+    with (
+        patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("search repeatedly")
+
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    assert "stopped retrying" in result["final_response"]
+    # Exactly one wrap-up was attempted: 3 calls to the first halt + 1.
+    assert result["api_calls"] == 4

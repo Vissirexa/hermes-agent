@@ -465,8 +465,14 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
-    if agent._tool_guardrail_halt_decision is not None:
-        result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
+    # Prefer the live halt decision; fall back to the one preserved by the
+    # wrap-up path in conversation_loop (which clears the live attribute so
+    # the loop can run one final tool-free call).
+    _guard_halt = agent._tool_guardrail_halt_decision or getattr(
+        agent, "_toolguard_last_halt_decision", None
+    )
+    if _guard_halt is not None:
+        result["guardrail"] = _guard_halt.to_metadata()
     # Surface any post-loop cleanup failures so the caller can distinguish a
     # clean turn from one whose trajectory/session/resource teardown raised
     # (the response is still returned either way — #8049).

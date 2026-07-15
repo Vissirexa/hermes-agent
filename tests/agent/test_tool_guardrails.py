@@ -228,6 +228,79 @@ def test_hard_stop_enabled_blocks_idempotent_no_progress_future_repeat():
     assert blocked.code == "idempotent_no_progress_block"
 
 
+def test_successful_mutating_call_resets_no_progress_counts():
+    """Interleaved page interactions must not accumulate snapshot repeats.
+
+    Regression for the browser false-positive: a session alternating
+    browser_click and browser_snapshot on a slow SPA reached the no-progress
+    block even though every snapshot legitimately followed a state-changing
+    action. A successful mutating call resets the no-progress ledger.
+    """
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            no_progress_warn_after=2,
+            no_progress_block_after=2,
+        )
+    )
+    snapshot_result = "same accessibility tree"
+
+    for _ in range(5):
+        assert controller.before_call("browser_snapshot", {}).action == "allow"
+        controller.after_call("browser_snapshot", {}, snapshot_result, failed=False)
+        controller.after_call("browser_click", {"ref": "@e5"}, '{"success": true}', failed=False)
+
+    assert controller.before_call("browser_snapshot", {}).action == "allow"
+    assert controller.halt_decision is None
+
+
+def test_failed_mutating_call_does_not_reset_no_progress_counts():
+    """A mutating call that failed changed nothing — repeats keep counting."""
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            no_progress_warn_after=2,
+            no_progress_block_after=2,
+        )
+    )
+    snapshot_result = "same accessibility tree"
+
+    for _ in range(2):
+        assert controller.before_call("browser_snapshot", {}).action == "allow"
+        controller.after_call("browser_snapshot", {}, snapshot_result, failed=False)
+        controller.after_call(
+            "browser_click", {"ref": "@e5"}, '{"success": false, "error": "no such ref"}',
+            failed=True,
+        )
+
+    blocked = controller.before_call("browser_snapshot", {})
+    assert blocked.action == "block"
+    assert blocked.code == "idempotent_no_progress_block"
+
+
+def test_browser_wait_success_resets_no_progress_counts():
+    """browser_wait counts as progress: waiting is the sanctioned way to poll."""
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            no_progress_warn_after=2,
+            no_progress_block_after=2,
+        )
+    )
+    snapshot_result = "loading spinner"
+
+    for _ in range(3):
+        assert controller.before_call("browser_snapshot", {}).action == "allow"
+        controller.after_call("browser_snapshot", {}, snapshot_result, failed=False)
+        controller.after_call(
+            "browser_wait", {"seconds": 3}, '{"success": true, "waited_seconds": 3.0}',
+            failed=False,
+        )
+
+    assert controller.before_call("browser_snapshot", {}).action == "allow"
+    assert controller.halt_decision is None
+
+
 def test_mutating_or_unknown_tools_are_not_blocked_for_repeated_identical_success_output_by_default():
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(no_progress_warn_after=2, no_progress_block_after=2)
