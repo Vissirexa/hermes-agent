@@ -6,6 +6,8 @@ from agent.tool_guardrails import (
     ToolCallGuardrailConfig,
     ToolCallGuardrailController,
     ToolCallSignature,
+    ToolGuardrailDecision,
+    append_toolguard_guidance,
     canonical_tool_args,
     classify_tool_failure,
 )
@@ -375,3 +377,115 @@ def test_repeated_multimodal_result_distinct_images_is_progress():
         )
         assert d.action == "allow"
     assert controller.halt_decision is None
+
+
+def test_repeated_result_interleaved_sequences_never_warn():
+    """A/B/A/C/A must stay silent: the same result recurring non-consecutively
+    is not a loop, and the warn/halt messages promise 'the last N calls', so
+    only a consecutive streak may count."""
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, repeated_result_warn_after=3)
+    )
+    bodies = {
+        key: '{"status":"success","output":"' + key * 240 + '"}' for key in "ABC"
+    }
+    for key in "ABACA":
+        d = controller.after_call("execute_code", {"code": key}, bodies[key], failed=False)
+        assert d.action == "allow"
+    assert controller.halt_decision is None
+
+
+def test_repeated_result_streak_restarts_after_interruption():
+    """A different result breaks the streak; a fresh run of identical results
+    must reach the threshold on its own before warning, and the reported count
+    reflects only the consecutive run."""
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(repeated_result_warn_after=3)
+    )
+    body_a = '{"status":"success","output":"' + "A" * 240 + '"}'
+    body_b = '{"status":"success","output":"' + "B" * 240 + '"}'
+
+    decisions = [
+        controller.after_call("execute_code", {"code": f"c{i}"}, body, failed=False)
+        for i, body in enumerate([body_a, body_a, body_b, body_a, body_a, body_a])
+    ]
+
+    assert [d.action for d in decisions[:5]] == ["allow"] * 5
+    assert decisions[5].action == "warn"
+    assert decisions[5].code == "repeated_result_warning"
+    assert decisions[5].count == 3
+
+
+def test_empty_success_envelope_loop_from_read_tool_trips_guard():
+    """The production case from issue #60084's report thread: session_search
+    returning {"success": true, "results": [], "count": 0} for 16 different
+    hallucinated queries. Too short for repeated_result_min_chars, but an
+    identical no-content success from a non-mutating tool is still a loop."""
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            repeated_result_warn_after=3,
+            repeated_result_halt_after=5,
+        )
+    )
+    envelope = '{"success": true, "results": [], "count": 0}'
+    decisions = [
+        controller.after_call("session_search", {"query": f"q{i}"}, envelope, failed=False)
+        for i in range(5)
+    ]
+    assert decisions[2].action == "warn"
+    assert decisions[2].code == "repeated_result_warning"
+    assert decisions[4].action == "halt"
+    assert decisions[4].code == "repeated_result_halt"
+
+
+def test_empty_success_envelope_from_mutating_tool_is_ignored():
+    """Mutating tools legitimately return the same terse success envelope on
+    every call — each call did its work, so no loop may be inferred."""
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, repeated_result_warn_after=2)
+    )
+    envelope = '{"success": true, "results": [], "count": 0}'
+    for i in range(6):
+        d = controller.after_call("todo", {"add": f"item-{i}"}, envelope, failed=False)
+        assert d.action == "allow"
+    assert controller.halt_decision is None
+
+
+def test_bare_success_ack_is_not_an_empty_envelope():
+    """{"success": true} with no emptiness marker is an acknowledgment, not a
+    no-content result; repeated acks from varying calls must stay silent."""
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, repeated_result_warn_after=2)
+    )
+    for i in range(6):
+        d = controller.after_call(
+            "web_extract", {"url": f"https://x/{i}"}, '{"success": true}', failed=False
+        )
+        assert d.action == "allow"
+    assert controller.halt_decision is None
+
+
+def test_append_toolguard_guidance_keeps_multimodal_dict_shape():
+    """Guidance on a multimodal result must not string-concatenate the dict:
+    it lands as a trailing text part and in text_summary, and the image parts
+    survive untouched."""
+    decision = ToolGuardrailDecision(
+        action="warn",
+        code="repeated_result_warning",
+        message="Same result repeated.",
+        tool_name="vision_analyze",
+        count=3,
+    )
+    original = _multimodal_vision_result("A" * 64)
+
+    updated = append_toolguard_guidance(original, decision)
+
+    assert updated["_multimodal"] is True
+    assert updated["content"][-1]["type"] == "text"
+    assert "repeated_result_warning" in updated["content"][-1]["text"]
+    assert "Tool loop warning" in updated["content"][-1]["text"]
+    assert any(part.get("type") == "image_url" for part in updated["content"])
+    assert "repeated_result_warning" in updated["text_summary"]
+    # The caller's dict is not mutated in place.
+    assert "repeated_result_warning" not in str(original)
