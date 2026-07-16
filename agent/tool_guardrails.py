@@ -314,7 +314,8 @@ class ToolCallGuardrailController:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
-        self._result_repeat_counts: dict[str, int] = {}
+        self._last_result_hash: str | None = None
+        self._result_streak: int = 0
         self._assistant_msg_counts: dict[str, int] = {}
         self._domain_failure_counts: dict[str, int] = {}
         self._halt_decision: ToolGuardrailDecision | None = None
@@ -393,7 +394,7 @@ class ToolCallGuardrailController:
         self,
         tool_name: str,
         args: Mapping[str, Any] | None,
-        result: str | None,
+        result: str | Mapping[str, Any] | None,
         *,
         failed: bool | None = None,
     ) -> ToolGuardrailDecision:
@@ -587,25 +588,45 @@ class ToolCallGuardrailController:
     def _track_result_repetition(
         self,
         tool_name: str,
-        result: str | None,
+        result: str | Mapping[str, Any] | None,
         signature: ToolCallSignature,
     ) -> ToolGuardrailDecision | None:
-        """Detect repeated identical tool results regardless of args/outcome.
+        """Detect a consecutive streak of identical tool results regardless of args/outcome.
 
-        Returns a halt decision once the same substantial result has recurred
-        ``repeated_result_halt_after`` times this turn, a warn decision at the
-        warn threshold, or ``None`` otherwise. Short results are ignored so
-        trivial outputs (``"[]"``, ``"OK"``, empty strings) never trip it.
+        Returns a halt decision once the same result has recurred on
+        ``repeated_result_halt_after`` consecutive calls this turn, a warn
+        decision at the warn threshold, or ``None`` otherwise. Any different or
+        untracked result breaks the streak, so interleaved sequences (A/B/A/C/A)
+        never fire and the "last N calls" wording in the messages stays literal.
+
+        Short results are ignored so trivial outputs (``"[]"``, ``"OK"``, empty
+        strings) never trip it — with one exception: an empty-success envelope
+        (``{"success": true, "results": [], ...}``) from a non-mutating tool
+        counts, because a read-style tool returning the same "nothing found"
+        payload for ever-changing queries is exactly the loop shape from
+        issue #60084, and repeated empty successes from mutating tools are
+        legitimate (each call did its work).
         """
         if not result:
+            self._last_result_hash = None
+            self._result_streak = 0
             return None
         text = _repetition_text(result)
-        if len(text) < self.config.repeated_result_min_chars:
+        if len(text) < self.config.repeated_result_min_chars and not (
+            tool_name not in self.config.mutating_tools
+            and _is_empty_success_envelope(result)
+        ):
+            self._last_result_hash = None
+            self._result_streak = 0
             return None
 
         result_hash = _result_hash(text)
-        count = self._result_repeat_counts.get(result_hash, 0) + 1
-        self._result_repeat_counts[result_hash] = count
+        if result_hash == self._last_result_hash:
+            self._result_streak += 1
+        else:
+            self._last_result_hash = result_hash
+            self._result_streak = 1
+        count = self._result_streak
 
         if self.config.hard_stop_enabled and count >= self.config.repeated_result_halt_after:
             return ToolGuardrailDecision(
@@ -681,16 +702,31 @@ def toolguard_synthetic_result(decision: ToolGuardrailDecision) -> str:
     )
 
 
-def append_toolguard_guidance(result: str, decision: ToolGuardrailDecision) -> str:
-    """Append runtime guidance to the current tool result content."""
+def append_toolguard_guidance(result: Any, decision: ToolGuardrailDecision) -> Any:
+    """Append runtime guidance to the current tool result content.
+
+    Plain string results get the guidance appended in place. Multimodal results
+    (``{"_multimodal": True, "content": [...]}``) keep their dict shape — the
+    guidance is added as a trailing text part (and mirrored into
+    ``text_summary`` when present) so providers and the text-only fallback both
+    surface it; string concatenation would raise on the dict.
+    """
     if decision.action not in {"warn", "halt"} or not decision.message:
         return result
     label = "Tool loop hard stop" if decision.action == "halt" else "Tool loop warning"
-    suffix = (
-        f"\n\n[{label}: "
+    guidance = (
+        f"[{label}: "
         f"{decision.code}; count={decision.count}; {decision.message}]"
     )
-    return (result or "") + suffix
+    if isinstance(result, Mapping) and result.get("_multimodal"):
+        updated = dict(result)
+        updated["content"] = list(updated.get("content") or []) + [
+            {"type": "text", "text": guidance}
+        ]
+        if updated.get("text_summary"):
+            updated["text_summary"] = f"{updated['text_summary']}\n\n{guidance}"
+        return updated
+    return (result or "") + f"\n\n{guidance}"
 
 
 def _tool_failure_recovery_hint(tool_name: str, count: int) -> str:
@@ -866,6 +902,35 @@ def _repetition_text(result: Any) -> str:
                 parts.append(f"[media:{_sha256(str(payload or ''))[:16]}]")
         return "\n".join(parts)
     return result if isinstance(result, str) else str(result)
+
+
+_EMPTY_PAYLOAD_KEYS = ("results", "items", "matches", "entries", "sessions", "data")
+
+
+def _is_empty_success_envelope(result: Any) -> bool:
+    """True for a JSON success payload that carries no content.
+
+    The shape from issue #60084: ``{"success": true, "results": [], "count": 0}``
+    — too short for ``repeated_result_min_chars`` but a loop signal all the
+    same when it keeps coming back for different queries. Requires an explicit
+    emptiness marker (``count == 0`` or an empty payload list), so a bare
+    ``{"success": true}`` acknowledgment never qualifies, and any non-empty
+    payload key disqualifies.
+    """
+    if not isinstance(result, str):
+        return False
+    parsed = safe_json_loads(result)
+    if not isinstance(parsed, Mapping) or parsed.get("success") is not True:
+        return False
+    empty = parsed.get("count") == 0
+    for key in _EMPTY_PAYLOAD_KEYS:
+        if key not in parsed:
+            continue
+        if parsed[key] in (None, [], {}, ""):
+            empty = True
+        else:
+            return False
+    return empty
 
 
 def _result_hash(result: str | None) -> str:
