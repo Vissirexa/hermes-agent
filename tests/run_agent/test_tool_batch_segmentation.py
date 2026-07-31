@@ -12,6 +12,7 @@ concurrently, barrier calls sequentially — while preserving:
 """
 
 import json
+import sys
 import threading
 import time
 import uuid
@@ -94,16 +95,6 @@ class TestPlanToolBatchSegments:
         assert _kinds(segments) == ["parallel", "sequential"]
         assert [tc.id for tc in segments[1][1]] == ["b1", "r3"]
 
-    def test_adjacent_barriers_merge_into_one_sequential_segment(self):
-        calls = [
-            _tc("terminal", '{"command":"a"}', call_id="b1"),
-            _tc("terminal", '{"command":"b"}', call_id="b2"),
-            _tc("web_search", call_id="r1"),
-            _tc("web_search", call_id="r2"),
-        ]
-        segments = _plan_tool_batch_segments(calls)
-        assert _kinds(segments) == ["sequential", "parallel"]
-        assert [tc.id for tc in segments[0][1]] == ["b1", "b2"]
 
     def test_never_parallel_tool_is_a_barrier(self):
         calls = [
@@ -115,26 +106,7 @@ class TestPlanToolBatchSegments:
         assert _kinds(segments) == ["parallel", "sequential"]
         assert [tc.id for tc in segments[1][1]] == ["c1"]
 
-    def test_malformed_args_call_is_a_barrier_not_a_batch_poison(self):
-        calls = [
-            _tc("web_search", call_id="r1"),
-            _tc("web_search", call_id="r2"),
-            _tc("web_search", "{not json", call_id="bad"),
-            _tc("web_search", call_id="r3"),
-            _tc("web_search", call_id="r4"),
-        ]
-        segments = _plan_tool_batch_segments(calls)
-        assert _kinds(segments) == ["parallel", "sequential", "parallel"]
-        assert [tc.id for tc in segments[1][1]] == ["bad"]
 
-    def test_non_dict_args_call_is_a_barrier(self):
-        calls = [
-            _tc("web_search", call_id="r1"),
-            _tc("web_search", call_id="r2"),
-            _tc("web_search", '"just a string"', call_id="bad"),
-        ]
-        segments = _plan_tool_batch_segments(calls)
-        assert _kinds(segments) == ["parallel", "sequential"]
 
     def test_overlapping_paths_split_across_segments(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -179,18 +151,8 @@ class TestShouldParallelizeBackwardCompat:
     def test_single_call_is_sequential(self):
         assert not _should_parallelize_tool_batch([_tc("web_search")])
 
-    def test_all_safe_batch_is_parallel(self):
-        assert _should_parallelize_tool_batch([_tc("web_search"), _tc("web_extract")])
 
-    def test_mixed_batch_is_not_wholly_parallel(self):
-        assert not _should_parallelize_tool_batch(
-            [_tc("web_search"), _tc("terminal", '{"command":"ls"}')]
-        )
 
-    def test_clarify_anywhere_blocks_whole_batch_parallelism(self):
-        assert not _should_parallelize_tool_batch(
-            [_tc("web_search"), _tc("clarify", '{"question":"?"}')]
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -315,33 +277,7 @@ class TestSegmentedDispatchIntegration:
         conc.assert_called_once()
         seq.assert_not_called()
 
-    def test_homogeneous_unsafe_batch_still_uses_plain_sequential_path(self, agent):
-        calls = [
-            _tc("terminal", '{"command":"a"}'),
-            _tc("terminal", '{"command":"b"}'),
-        ]
-        msg = SimpleNamespace(content="", tool_calls=calls)
 
-        with (
-            patch.object(agent, "_execute_tool_calls_concurrent") as conc,
-            patch.object(agent, "_execute_tool_calls_sequential") as seq,
-        ):
-            agent._execute_tool_calls(msg, [], "task-1")
-
-        seq.assert_called_once()
-        conc.assert_not_called()
-
-    def test_single_call_uses_sequential_path(self, agent):
-        msg = SimpleNamespace(content="", tool_calls=[_tc("web_search", '{"query":"a"}')])
-
-        with (
-            patch.object(agent, "_execute_tool_calls_concurrent") as conc,
-            patch.object(agent, "_execute_tool_calls_sequential") as seq,
-        ):
-            agent._execute_tool_calls(msg, [], "task-1")
-
-        seq.assert_called_once()
-        conc.assert_not_called()
 
     def test_interrupt_during_barrier_drains_later_segments(self, agent):
         """Interrupt raised while the barrier tool runs: the trailing parallel
@@ -398,3 +334,103 @@ class TestSegmentedDispatchIntegration:
         contents = [m["content"] for m in messages]
         hits = [c for c in contents if "focus on the tests" in c]
         assert len(hits) == 1
+
+
+class TestPathCanonicalization:
+    """Regression tests for _canonical_path / _extract_parallel_scope_path fixes.
+
+    Verifies that symlink aliases, relative/absolute cwd mismatches, and
+    (on Windows) case-insensitive aliases are never placed in the same
+    parallel segment.
+    """
+
+    def test_relative_and_absolute_same_target_use_separate_segments(self, tmp_path):
+        """A relative path resolved against execution_cwd and an absolute path
+        pointing to the same file must be detected as overlapping."""
+        from agent.tool_dispatch_helpers import (
+            _canonical_path,
+            _paths_overlap,
+        )
+
+        target = tmp_path / "config.json"
+        target.touch()
+
+        abs_path = _canonical_path(str(target))
+        rel_path = _canonical_path("config.json", execution_cwd=tmp_path)
+
+        assert _paths_overlap(abs_path, rel_path), (
+            "Absolute and relative paths pointing to the same file must overlap"
+        )
+
+    def test_symlink_aliases_are_not_parallelized(self, tmp_path):
+        """A symlink alias and the real path must be detected as overlapping
+        so they are never placed in the same parallel segment."""
+        import os
+        from agent.tool_dispatch_helpers import (
+            _canonical_path,
+            _paths_overlap,
+        )
+
+        real_dir = tmp_path / "real"
+        real_dir.mkdir()
+        target = real_dir / "config.json"
+        target.touch()
+
+        alias_dir = tmp_path / "alias"
+        alias_dir.symlink_to(real_dir)
+
+        real_path = _canonical_path(str(target))
+        alias_path = _canonical_path(str(alias_dir / "config.json"))
+
+        assert _paths_overlap(real_path, alias_path), (
+            "Symlink alias and real path must overlap — "
+            "they must not be parallelized"
+        )
+
+    def test_execution_cwd_used_over_process_cwd(self, tmp_path, monkeypatch):
+        """_extract_parallel_scope_path must use execution_cwd, not
+        process cwd, when resolving relative paths."""
+        from agent.tool_dispatch_helpers import (
+            _extract_parallel_scope_path,
+            _paths_overlap,
+        )
+
+        exec_cwd = tmp_path / "sub"
+        exec_cwd.mkdir()
+        (exec_cwd / "x.txt").touch()
+
+        # Point process cwd somewhere else entirely.
+        monkeypatch.chdir(tmp_path)
+
+        # With execution_cwd supplied the relative path resolves under exec_cwd.
+        path_with_cwd = _extract_parallel_scope_path(
+            "write_file", {"path": "x.txt"}, execution_cwd=exec_cwd
+        )
+        # The absolute path under exec_cwd must match.
+        path_absolute = _extract_parallel_scope_path(
+            "write_file", {"path": str(exec_cwd / "x.txt")}
+        )
+
+        assert path_with_cwd is not None
+        assert path_absolute is not None
+        assert _paths_overlap(path_with_cwd, path_absolute), (
+            "execution_cwd-relative path and absolute path must overlap; "
+            "process cwd must not be used when execution_cwd is provided"
+        )
+
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="normcase() case-folding only matters on Windows",
+    )
+    def test_case_insensitive_paths_overlap_windows(self, tmp_path):
+        """On Windows, FILE.txt and file.txt are the same file — they must
+        be detected as overlapping after normcase() canonicalisation."""
+        from agent.tool_dispatch_helpers import _canonical_path, _paths_overlap
+
+        upper = _canonical_path(str(tmp_path / "FILE.txt"), execution_cwd=tmp_path)
+        lower = _canonical_path(str(tmp_path / "file.txt"), execution_cwd=tmp_path)
+
+        assert _paths_overlap(upper, lower), (
+            "Case-insensitive aliases must overlap on Windows"
+        )

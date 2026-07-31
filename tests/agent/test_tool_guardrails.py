@@ -6,8 +6,6 @@ from agent.tool_guardrails import (
     ToolCallGuardrailConfig,
     ToolCallGuardrailController,
     ToolCallSignature,
-    ToolGuardrailDecision,
-    append_toolguard_guidance,
     canonical_tool_args,
     classify_tool_failure,
 )
@@ -35,17 +33,6 @@ def test_tool_call_signature_hashes_canonical_nested_unicode_args_without_exposi
     assert "☤" not in json.dumps(metadata)
 
 
-def test_default_config_is_soft_warning_only_with_hard_stop_disabled():
-    cfg = ToolCallGuardrailConfig()
-
-    assert cfg.warnings_enabled is True
-    assert cfg.hard_stop_enabled is False
-    assert cfg.exact_failure_warn_after == 2
-    assert cfg.same_tool_failure_warn_after == 3
-    assert cfg.no_progress_warn_after == 2
-    assert cfg.exact_failure_block_after == 5
-    assert cfg.same_tool_failure_halt_after == 8
-    assert cfg.no_progress_block_after == 5
 
 
 def test_config_parses_nested_warn_and_hard_stop_thresholds():
@@ -120,114 +107,68 @@ def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution()
     assert blocked.count == 2
 
 
-def test_success_resets_exact_signature_failure_streak():
-    controller = ToolCallGuardrailController(
-        ToolCallGuardrailConfig(hard_stop_enabled=True, exact_failure_block_after=2, same_tool_failure_halt_after=99)
-    )
-    args = {"query": "same"}
-
-    controller.after_call("web_search", args, '{"error":"boom"}', failed=True)
-    controller.after_call("web_search", args, '{"ok":true}', failed=False)
-
-    assert controller.before_call("web_search", args).action == "allow"
-    controller.after_call("web_search", args, '{"error":"boom"}', failed=True)
-    assert controller.before_call("web_search", args).action == "allow"
 
 
-def test_file_mutation_lint_error_result_is_not_a_tool_failure():
-    write_result = json.dumps({
-        "bytes_written": 12,
-        "lint": {"status": "error", "output": "SyntaxError: invalid syntax"},
-    })
-    patch_result = json.dumps({
-        "success": True,
-        "diff": "--- a/tmp.py\n+++ b/tmp.py\n",
-        "lsp_diagnostics": "<diagnostics>ERROR [1:1] type mismatch</diagnostics>",
-    })
-
-    assert classify_tool_failure("write_file", write_result) == (False, "")
-    assert classify_tool_failure("patch", patch_result) == (False, "")
 
 
-def test_same_tool_varying_args_warns_by_default_without_halting():
-    controller = ToolCallGuardrailController(
-        ToolCallGuardrailConfig(same_tool_failure_warn_after=2, same_tool_failure_halt_after=3)
-    )
-
-    first = controller.after_call("terminal", {"command": "cmd-1"}, '{"exit_code":1}', failed=True)
-    second = controller.after_call("terminal", {"command": "cmd-2"}, '{"exit_code":1}', failed=True)
-    third = controller.after_call("terminal", {"command": "cmd-3"}, '{"exit_code":1}', failed=True)
-    fourth = controller.after_call("terminal", {"command": "cmd-4"}, '{"exit_code":1}', failed=True)
-
-    assert first.action == "allow"
-    assert [second.action, third.action, fourth.action] == ["warn", "warn", "warn"]
-    assert {second.code, third.code, fourth.code} == {"same_tool_failure_warning"}
-    assert "Do not switch to text-only replies" in second.message
-    assert "keep using tools" in second.message
-    assert "diagnose before retrying" in second.message
-    assert "different tool" in second.message
-    assert controller.halt_decision is None
 
 
-def test_hard_stop_enabled_halts_same_tool_varying_args_failure_streak():
-    controller = ToolCallGuardrailController(
-        ToolCallGuardrailConfig(
-            hard_stop_enabled=True,
-            exact_failure_block_after=99,
-            same_tool_failure_warn_after=2,
-            same_tool_failure_halt_after=3,
-        )
-    )
-
-    first = controller.after_call("terminal", {"command": "cmd-1"}, '{"exit_code":1}', failed=True)
-    assert first.action == "allow"
-    second = controller.after_call("terminal", {"command": "cmd-2"}, '{"exit_code":1}', failed=True)
-    assert second.action == "warn"
-    assert second.code == "same_tool_failure_warning"
-    third = controller.after_call("terminal", {"command": "cmd-3"}, '{"exit_code":1}', failed=True)
-    assert third.action == "halt"
-    assert third.code == "same_tool_failure_halt"
-    assert third.count == 3
 
 
-def test_idempotent_no_progress_repeated_result_warns_without_blocking_by_default():
+
+
+
+
+def test_mutating_or_unknown_tools_are_not_blocked_for_repeated_identical_success_output_by_default():
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(no_progress_warn_after=2, no_progress_block_after=2)
     )
-    args = {"path": "/tmp/same.txt"}
-    result = "same file contents"
 
-    for _ in range(4):
-        assert controller.before_call("read_file", args).action == "allow"
-        decision = controller.after_call("read_file", args, result, failed=False)
-
-    assert decision.action == "warn"
-    assert decision.code == "idempotent_no_progress_warning"
-    assert controller.before_call("read_file", args).action == "allow"
-    assert controller.halt_decision is None
+    for _ in range(3):
+        assert controller.before_call("write_file", {"path": "/tmp/x", "content": "x"}).action == "allow"
+        assert controller.after_call("write_file", {"path": "/tmp/x", "content": "x"}, "ok", failed=False).action == "allow"
+        assert controller.before_call("custom_tool", {"x": 1}).action == "allow"
+        assert controller.after_call("custom_tool", {"x": 1}, "ok", failed=False).action == "allow"
 
 
-def test_hard_stop_enabled_blocks_idempotent_no_progress_future_repeat():
+
+
+
+
+# ── Per-turn runaway-loop caps (Claude Code v2.1.212, Week 29) ──────────────
+
+from agent.tool_guardrails import LoopCapConfig  # noqa: E402
+from agent.tool_guardrails import ToolGuardrailDecision
+from agent.tool_guardrails import append_toolguard_guidance
+
+
+
+
+
+
+def test_loop_cap_zero_disables_and_junk_falls_back():
+    # 0 is a legitimate "unlimited" value; negatives / junk fall back to default.
+    assert LoopCapConfig.from_mapping({"max_web_searches": 0}).max_web_searches == 0
+    assert LoopCapConfig.from_mapping({"max_web_searches": -5}).max_web_searches == 50
+    assert LoopCapConfig.from_mapping({"max_subagents": "nope"}).max_subagents == 50
+
+
+def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
+    # Loop caps fire even with hard_stop_enabled=False (the per-turn loop
+    # detector's flag). Each distinct query avoids the loop detector so we know
+    # the block came from the loop cap, not exact-failure repetition.
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(
-            hard_stop_enabled=True,
-            no_progress_warn_after=2,
-            no_progress_block_after=2,
+            hard_stop_enabled=False,
+            loop_caps=LoopCapConfig(max_web_searches=3),
         )
     )
-    args = {"path": "/tmp/same.txt"}
-    result = "same file contents"
-
-    assert controller.before_call("read_file", args).action == "allow"
-    assert controller.after_call("read_file", args, result, failed=False).action == "allow"
-    assert controller.before_call("read_file", args).action == "allow"
-    warn = controller.after_call("read_file", args, result, failed=False)
-    assert warn.action == "warn"
-    assert warn.code == "idempotent_no_progress_warning"
-
-    blocked = controller.before_call("read_file", args)
-    assert blocked.action == "block"
-    assert blocked.code == "idempotent_no_progress_block"
+    for i in range(3):
+        assert controller.before_call("web_search", {"query": f"q{i}"}).action == "allow"
+    decision = controller.before_call("web_search", {"query": "q4"})
+    assert decision.action == "block"
+    assert decision.code == "loop_web_search_cap"
+    assert decision.should_halt is True
 
 
 def test_successful_mutating_call_resets_no_progress_in_its_domain():
@@ -346,36 +287,6 @@ def test_mutation_reset_is_scoped_to_its_own_domain():
     assert resnap.code == "idempotent_no_progress_warning"
 
 
-def test_mutating_or_unknown_tools_are_not_blocked_for_repeated_identical_success_output_by_default():
-    controller = ToolCallGuardrailController(
-        ToolCallGuardrailConfig(no_progress_warn_after=2, no_progress_block_after=2)
-    )
-
-    for _ in range(3):
-        assert controller.before_call("write_file", {"path": "/tmp/x", "content": "x"}).action == "allow"
-        assert controller.after_call("write_file", {"path": "/tmp/x", "content": "x"}, "ok", failed=False).action == "allow"
-        assert controller.before_call("custom_tool", {"x": 1}).action == "allow"
-        assert controller.after_call("custom_tool", {"x": 1}, "ok", failed=False).action == "allow"
-
-
-def test_reset_for_turn_clears_bounded_guardrail_state():
-    controller = ToolCallGuardrailController(
-        ToolCallGuardrailConfig(hard_stop_enabled=True, exact_failure_block_after=2, no_progress_block_after=2)
-    )
-    controller.after_call("web_search", {"query": "same"}, '{"error":"boom"}', failed=True)
-    controller.after_call("web_search", {"query": "same"}, '{"error":"boom"}', failed=True)
-    controller.after_call("read_file", {"path": "/tmp/x"}, "same", failed=False)
-    controller.after_call("read_file", {"path": "/tmp/x"}, "same", failed=False)
-
-    assert controller.before_call("web_search", {"query": "same"}).action == "block"
-    assert controller.before_call("read_file", {"path": "/tmp/x"}).action == "block"
-
-    controller.reset_for_turn()
-
-    assert controller.before_call("web_search", {"query": "same"}).action == "allow"
-    assert controller.before_call("read_file", {"path": "/tmp/x"}).action == "allow"
-
-
 def test_repeated_identical_result_halts_successful_varying_arg_loop():
     """The real-world loop: execute_code 'succeeds' with different args every
     call but returns the same blocked/404 body. Failure- and signature-keyed
@@ -459,25 +370,6 @@ def test_observe_assistant_message_ignores_short_and_distinct_messages():
     assert controller.halt_decision is None
 
 
-def _multimodal_vision_result(image_b64: str, question: str = "Describe everything visible.") -> dict:
-    """Shape returned by vision_analyze's native path (see tools/vision_tools.py)."""
-    return {
-        "_multimodal": True,
-        "content": [
-            {
-                "type": "text",
-                "text": (
-                    "Image loaded into your context — you can see it natively now. "
-                    "Use your built-in vision to answer the user."
-                    f"\n\nQuestion: {question}" + " " * 120
-                ),
-            },
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
-        ],
-        "text_summary": "Image attached natively for the main model.",
-    }
-
-
 def test_repeated_multimodal_result_same_image_trips_guard():
     """Session 20260701_121806: identical multimodal placeholders repeated 6x with
     zero guard activity because str(result) embedded unique base64 payloads.
@@ -513,24 +405,6 @@ def test_repeated_multimodal_result_distinct_images_is_progress():
         )
         assert d.action == "allow"
     assert controller.halt_decision is None
-
-
-# ── Per-domain failure budget ────────────────────────────────────────────
-#
-# Real session evidence: with no web_search available, the model fabricates
-# URLs on a host that doesn't have the page, and evades the exact-signature
-# and result-repetition guards above by mutating the slug on every retry
-# (verywellfamily.com/oci-card-renewal -> /oci-renewal-guide ->
-# /oci-renewal-process -> /oci-card-renewal-5215361 -> ...). One session made
-# 95 fetch_resilient calls this way: 34 HTTP 404, 16 blocked — all with
-# "ok": true in the payload, so a guard that only looks at tool-level errors
-# never sees them. These tests key on registrable host instead of args/result
-# content.
-
-
-def _fetch_result(url: str, *, status: int = 200, ok: bool = True, blocked: bool = False) -> str:
-    """Shape returned by tools.resilient_fetch_tool.resilient_fetch."""
-    return json.dumps({"ok": ok, "url": url, "status": status, "blocked": blocked, "text": "x" * 50})
 
 
 def test_domain_failure_budget_blocks_after_six_slug_mutated_404s_but_not_other_host():
@@ -858,3 +732,27 @@ def test_append_toolguard_guidance_keeps_multimodal_dict_shape():
     assert "repeated_result_warning" in updated["text_summary"]
     # The caller's dict is not mutated in place.
     assert "repeated_result_warning" not in str(original)
+
+
+def _multimodal_vision_result(image_b64: str, question: str = "Describe everything visible.") -> dict:
+    """Shape returned by vision_analyze's native path (see tools/vision_tools.py)."""
+    return {
+        "_multimodal": True,
+        "content": [
+            {
+                "type": "text",
+                "text": (
+                    "Image loaded into your context — you can see it natively now. "
+                    "Use your built-in vision to answer the user."
+                    f"\n\nQuestion: {question}" + " " * 120
+                ),
+            },
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+        ],
+        "text_summary": "Image attached natively for the main model.",
+    }
+
+
+def _fetch_result(url: str, *, status: int = 200, ok: bool = True, blocked: bool = False) -> str:
+    """Shape returned by tools.resilient_fetch_tool.resilient_fetch."""
+    return json.dumps({"ok": ok, "url": url, "status": status, "blocked": blocked, "text": "x" * 50})

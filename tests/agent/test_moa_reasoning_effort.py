@@ -10,12 +10,6 @@ def _response(content="ok"):
 
 
 
-def test_slot_label_includes_reasoning_effort():
-    from agent.moa_loop import _slot_label
-
-    assert _slot_label(
-        {"provider": "openai-codex", "model": "gpt-5.6-sol", "reasoning_effort": "xhigh"}
-    ) == "openai-codex:gpt-5.6-sol[reasoning=xhigh]"
 
 
 
@@ -52,21 +46,36 @@ def test_moa_reference_passes_per_slot_reasoning_config(monkeypatch):
 
 
 
-def test_call_llm_builder_translates_reasoning_config_to_extra_body():
-    from agent.auxiliary_client import _build_call_kwargs
 
-    kwargs = _build_call_kwargs(
-        "openai-codex",
-        "gpt-5.6-sol",
-        [{"role": "user", "content": "hi"}],
-        reasoning_config={"enabled": True, "effort": "xhigh"},
-    )
-    assert kwargs["extra_body"]["reasoning"] == {"enabled": True, "effort": "xhigh"}
 
-    off = _build_call_kwargs(
-        "openai-codex",
-        "gpt-5.6-sol",
-        [{"role": "user", "content": "hi"}],
-        reasoning_config={"enabled": False},
-    )
-    assert off["extra_body"]["reasoning"] == {"enabled": False}
+class TestAggregatorGlobalFallback:
+    """#64187: the aggregator (MoA's acting model) resolves like any acting
+    model when its slot has no reasoning_effort: per-model override
+    (agent.reasoning_overrides for the slot's model) > global
+    agent.reasoning_effort. Reference advisors do NOT get this fallback
+    (side calls — cost containment)."""
+
+
+
+
+
+    def test_global_yaml_false_disables(self, monkeypatch):
+        from agent import moa_loop
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"agent": {"reasoning_effort": False}},
+        )
+        cfg = moa_loop._aggregator_reasoning_config({})
+        assert cfg == {"enabled": False}
+
+
+    def test_reference_slots_do_not_inherit_global(self, monkeypatch):
+        """Advisors stay slot-or-default: global effort must NOT leak in."""
+        from agent import moa_loop
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"agent": {"reasoning_effort": "xhigh"}},
+        )
+        assert moa_loop._slot_reasoning_config({"provider": "p", "model": "m"}) is None

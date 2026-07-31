@@ -11,6 +11,7 @@ wiring.
 import types
 
 import tools.file_tools as ft
+import tools.terminal_tool as tt
 from tools.file_tools import clear_task_trackers
 
 
@@ -20,7 +21,7 @@ def _seed(task_id: str) -> None:
     with ft._patch_failure_lock:
         ft._patch_failure_tracker[task_id] = {"/tmp/a.py": 2}
     with ft._file_ops_lock:
-        ft._last_known_cwd[task_id] = "/tmp"
+        tt._session_cwd[task_id] = "/tmp"
         ft._file_ops_cache[task_id] = object()
 
 
@@ -40,7 +41,7 @@ class TestClearTaskTrackers:
             with ft._patch_failure_lock:
                 assert tid not in ft._patch_failure_tracker
             with ft._file_ops_lock:
-                assert tid not in ft._last_known_cwd
+                assert tid not in tt._session_cwd
                 assert tid not in ft._file_ops_cache
         finally:
             _purge(tid)
@@ -54,7 +55,7 @@ class TestClearTaskTrackers:
             with ft._read_tracker_lock:
                 assert alive in ft._read_tracker
             with ft._file_ops_lock:
-                assert ft._last_known_cwd.get(alive) == "/tmp"
+                assert tt._session_cwd.get(alive) == "/tmp"
         finally:
             _purge(dead, alive)
 
@@ -65,15 +66,15 @@ class TestClearTaskTrackers:
         child = "subagent-4-33333333"
         _seed(child)
         with ft._file_ops_lock:
-            ft._last_known_cwd["default"] = "/parent/cwd"
+            tt._session_cwd["default"] = "/parent/cwd"
         try:
             clear_task_trackers(child)
             with ft._file_ops_lock:
-                assert ft._last_known_cwd.get("default") == "/parent/cwd"
+                assert tt._session_cwd.get("default") == "/parent/cwd"
         finally:
             _purge(child)
             with ft._file_ops_lock:
-                ft._last_known_cwd.pop("default", None)
+                tt._session_cwd.pop("default", None)
 
     def test_empty_and_missing_ids_are_noops(self):
         clear_task_trackers("")

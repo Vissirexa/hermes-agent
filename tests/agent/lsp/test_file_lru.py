@@ -1,6 +1,6 @@
 """LRU cap on the client's tracked-file text cache.
 
-``LSPClient._files`` holds every opened file's full text (and the server
+``LSPClient._docs`` holds every opened file's full text (and the server
 mirrors each open document in its own memory) with no per-file eviction —
 a marathon coding run pinned the contents of every file it ever touched
 until the whole client was idle-reaped. The cap evicts the least recently
@@ -52,16 +52,16 @@ async def test_open_files_evicted_beyond_cap(tmp_path: Path, monkeypatch):
             await client.open_file(path, language_id="python")
 
         # Cap holds; the two least-recently-opened files were evicted.
-        assert len(client._files) == 3
-        assert files[0] not in client._files
-        assert files[1] not in client._files
-        assert set(files[2:]).issubset(client._files)
+        assert len(client._docs) == 3
+        assert files[0] not in client._docs
+        assert files[1] not in client._docs
+        assert set(files[2:]).issubset(client._docs)
 
         # An evicted file re-opens transparently as a fresh didOpen.
         version = await client.open_file(files[0], language_id="python")
         assert version == 0
-        assert files[0] in client._files
-        assert len(client._files) == 3
+        assert files[0] in client._docs
+        assert len(client._docs) == 3
 
         # A still-tracked file keeps taking the didChange path.
         version = await client.open_file(files[4], language_id="python")
@@ -90,8 +90,8 @@ async def test_reopen_refreshes_lru_recency(tmp_path: Path, monkeypatch):
         await client.open_file(a_p, language_id="python")
         await client.open_file(c_p, language_id="python")
 
-        assert b_p not in client._files
-        assert {a_p, c_p} == set(client._files)
+        assert b_p not in client._docs
+        assert {a_p, c_p} == set(client._docs)
     finally:
         await client.shutdown()
 

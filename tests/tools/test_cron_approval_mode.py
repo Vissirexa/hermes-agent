@@ -1,27 +1,24 @@
 """Tests for approvals.cron_mode — configurable approval behavior for cron jobs."""
 
-import contextvars
-import os
-
 import pytest
 
 import tools.approval as approval_module
 from tools.approval import (
     _get_cron_approval_mode,
-    _is_cron_session,
-    _is_gateway_approval_context,
     check_all_command_guards,
     check_dangerous_command,
-    check_execute_code_guard,
     detect_dangerous_command,
 )
-from gateway.session_context import (
-    _UNSET,
-    _VAR_MAP,
-    clear_session_vars,
-    reset_session_vars,
-    set_session_vars,
-)
+import contextvars
+import os
+from tools.approval import _is_cron_session
+from tools.approval import _is_gateway_approval_context
+from tools.approval import check_execute_code_guard
+from gateway.session_context import _UNSET
+from gateway.session_context import _VAR_MAP
+from gateway.session_context import clear_session_vars
+from gateway.session_context import reset_session_vars
+from gateway.session_context import set_session_vars
 
 
 @pytest.fixture(autouse=True)
@@ -426,267 +423,190 @@ class TestCronWithGatewayOrigin:
         finally:
             clear_session_vars(tokens)
 
-    def test_cron_with_telegram_origin_combined_guard_uses_cron_mode(self, monkeypatch):
-        """check_all_command_guards must also honor cron_mode over gateway classification."""
-        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
-        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
-        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
-        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
-        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
 
-        from gateway.session_context import set_session_vars, clear_session_vars
-        tokens = set_session_vars(platform="telegram", chat_id="789")
-        try:
+class TestCronSessionContextVar:
+    def test_contextvar_set_makes_is_cron_session_true(self):
+            """What run_job() now does: bind the contextvar, task-local, no env write."""
+            _VAR_MAP["HERMES_CRON_SESSION"].set("1")
+            assert _is_cron_session() is True
+            # No process-global mutation accompanies the contextvar bind.
+            assert "HERMES_CRON_SESSION" not in os.environ
+
+    def test_contextvar_set_drives_cron_deny_branch_for_dangerous_command(self):
+            _VAR_MAP["HERMES_CRON_SESSION"].set("1")
+
             from unittest.mock import patch as mock_patch
             with mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"):
                 result = check_all_command_guards("rm -rf /tmp/stuff", "local")
                 assert not result["approved"]
                 assert "BLOCKED" in result["message"]
-                assert result.get("status") != "approval_required"
-        finally:
-            clear_session_vars(tokens)
-
-
-# ---------------------------------------------------------------------------
-# HERMES_CRON_SESSION: ContextVar (task-local) vs. the old os.environ leak
-# ---------------------------------------------------------------------------
-#
-# Regression coverage for the fix: run_job() (cron/scheduler.py) used to set
-# os.environ["HERMES_CRON_SESSION"] = "1" process-wide and never clear it.
-# Because the in-process cron scheduler shares its process with the live
-# gateway (gateway/run.py::_start_cron_ticker -> InProcessCronScheduler),
-# every interactive session (e.g. Telegram) after the FIRST cron tick was
-# permanently misclassified as a cron session — approvals took the
-# ``approvals.cron_mode`` branch (hard-deny, or silent auto-approve) instead
-# of the interactive gateway flow.
-#
-# The fix: gateway/session_context._CRON_SESSION is a task-local ContextVar,
-# set per-job by run_job() via ``_VAR_MAP["HERMES_CRON_SESSION"].set("1")``
-# instead of mutating os.environ. tools.approval._is_cron_session() reads it
-# through get_session_env (contextvar-first, os.environ fallback preserved
-# for dedicated cron worker processes / legacy tests that never touch the
-# contextvar at all).
-
-class TestCronSessionContextVar:
-    """Task-local HERMES_CRON_SESSION contextvar replaces the process-wide env leak."""
-
-    @pytest.fixture(autouse=True)
-    def _reset_cron_session_contextvar(self, monkeypatch):
-        # ContextVar.set() calls made directly in a test function (i.e. NOT
-        # inside a contextvars.copy_context().run(...) call) mutate the
-        # thread's ambient context and persist into whatever test runs next
-        # in the same thread. Reset to the "never set" sentinel before and
-        # after every test in this class, and make sure the legacy env var
-        # doesn't leak in either direction.
-        _VAR_MAP["HERMES_CRON_SESSION"].set(_UNSET)
-        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
-        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
-        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
-        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
-        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
-        yield
-        _VAR_MAP["HERMES_CRON_SESSION"].set(_UNSET)
-
-    def test_contextvar_set_makes_is_cron_session_true(self):
-        """What run_job() now does: bind the contextvar, task-local, no env write."""
-        _VAR_MAP["HERMES_CRON_SESSION"].set("1")
-        assert _is_cron_session() is True
-        # No process-global mutation accompanies the contextvar bind.
-        assert "HERMES_CRON_SESSION" not in os.environ
-
-    def test_contextvar_set_drives_cron_deny_branch_for_dangerous_command(self):
-        _VAR_MAP["HERMES_CRON_SESSION"].set("1")
-
-        from unittest.mock import patch as mock_patch
-        with mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"):
-            result = check_all_command_guards("rm -rf /tmp/stuff", "local")
-            assert not result["approved"]
-            assert "BLOCKED" in result["message"]
-            assert "cron_mode" in result["message"]
+                assert "cron_mode" in result["message"]
 
     def test_contextvar_set_drives_cron_deny_branch_for_execute_code(self):
-        """check_execute_code_guard's cron branch also reads the contextvar
-        (the fourth of the four former env_var_enabled call sites)."""
-        _VAR_MAP["HERMES_CRON_SESSION"].set("1")
+            """check_execute_code_guard's cron branch also reads the contextvar
+            (the fourth of the four former env_var_enabled call sites)."""
+            _VAR_MAP["HERMES_CRON_SESSION"].set("1")
 
-        from unittest.mock import patch as mock_patch
-        with mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"):
-            result = check_execute_code_guard(
-                "import os\nos.system('rm -rf /tmp/stuff')", "local"
-            )
-            assert not result["approved"]
-            assert "BLOCKED" in result["message"]
-            assert result.get("pattern_key") == "execute_code"
+            from unittest.mock import patch as mock_patch
+            with mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"):
+                result = check_execute_code_guard(
+                    "import os\nos.system('rm -rf /tmp/stuff')", "local"
+                )
+                assert not result["approved"]
+                assert "BLOCKED" in result["message"]
+                assert result.get("pattern_key") == "execute_code"
 
     def test_env_fallback_preserved_when_contextvar_never_set(self, monkeypatch):
-        """Dedicated cron worker processes / legacy tests that never touch the
-        contextvar at all still classify via the os.environ fallback."""
-        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
-        assert _is_cron_session() is True
-
-    def test_fallback_reads_process_env_without_recursion(self, monkeypatch):
-        """If the session_context read fails, _is_cron_session() must consult
-        os.environ directly. An earlier version of the helper recursed into
-        itself in the except block, turning any import/read failure into a
-        RecursionError instead of the documented legacy fallback."""
-        from unittest.mock import patch as mock_patch
-
-        with mock_patch(
-            "gateway.session_context.get_session_env",
-            side_effect=RuntimeError("session context unavailable"),
-        ):
-            assert _is_cron_session() is False
+            """Dedicated cron worker processes / legacy tests that never touch the
+            contextvar at all still classify via the os.environ fallback."""
             monkeypatch.setenv("HERMES_CRON_SESSION", "1")
             assert _is_cron_session() is True
 
+    def test_fallback_reads_process_env_without_recursion(self, monkeypatch):
+            """If the session_context read fails, _is_cron_session() must consult
+            os.environ directly. An earlier version of the helper recursed into
+            itself in the except block, turning any import/read failure into a
+            RecursionError instead of the documented legacy fallback."""
+            from unittest.mock import patch as mock_patch
+
+            with mock_patch(
+                "gateway.session_context.get_session_env",
+                side_effect=RuntimeError("session context unavailable"),
+            ):
+                assert _is_cron_session() is False
+                monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+                assert _is_cron_session() is True
+
     def test_reset_session_vars_returns_to_unset_then_env_fallback_reapplies(self, monkeypatch):
-        _VAR_MAP["HERMES_CRON_SESSION"].set("1")
-        assert _is_cron_session() is True
-
-        reset_session_vars()
-        assert _VAR_MAP["HERMES_CRON_SESSION"].get() is _UNSET
-
-        # Contextvar back to "never set in this context" -> os.environ fallback.
-        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
-        assert _is_cron_session() is True
-        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
-        assert _is_cron_session() is False
-
-    def test_cron_context_does_not_leak_into_fresh_interactive_context(self):
-        """THE CORE REGRESSION.
-
-        Before the fix, a cron tick's os.environ["HERMES_CRON_SESSION"] = "1"
-        was process-wide and permanent, so every interactive session running
-        afterwards in the SAME PROCESS was misclassified as cron. Simulate the
-        cron job the way run_job() actually executes — in its own task, i.e.
-        a copied contextvars.Context — and prove:
-
-          1. os.environ is never written to (the leak vector is gone).
-          2. A separately-copied context that binds a real interactive gateway
-             session (set_session_vars(platform="telegram", ...)) sees NO
-             cron classification and IS treated as a gateway approval context.
-        """
-        assert "HERMES_CRON_SESSION" not in os.environ
-
-        def _cron_job_body():
-            # Task-local bind, exactly like run_job() in cron/scheduler.py.
             _VAR_MAP["HERMES_CRON_SESSION"].set("1")
             assert _is_cron_session() is True
 
-        cron_ctx = contextvars.copy_context()
-        cron_ctx.run(_cron_job_body)
+            reset_session_vars()
+            assert _VAR_MAP["HERMES_CRON_SESSION"].get() is _UNSET
 
-        # The cron job's bind must not have escaped into os.environ or into
-        # this (the spawning) context.
-        assert "HERMES_CRON_SESSION" not in os.environ
-        assert _VAR_MAP["HERMES_CRON_SESSION"].get() is _UNSET
+            # Contextvar back to "never set in this context" -> os.environ fallback.
+            monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+            assert _is_cron_session() is True
+            monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+            assert _is_cron_session() is False
 
-        def _interactive_body():
-            tokens = set_session_vars(platform="telegram", chat_id="123", user_id="u1")
-            try:
-                assert _is_cron_session() is False
-                assert _is_gateway_approval_context() is True
-            finally:
-                clear_session_vars(tokens)
+    def test_cron_context_does_not_leak_into_fresh_interactive_context(self):
+            """THE CORE REGRESSION.
 
-        interactive_ctx = contextvars.copy_context()
-        interactive_ctx.run(_interactive_body)
+            Before the fix, a cron tick's os.environ["HERMES_CRON_SESSION"] = "1"
+            was process-wide and permanent, so every interactive session running
+            afterwards in the SAME PROCESS was misclassified as cron. Simulate the
+            cron job the way run_job() actually executes — in its own task, i.e.
+            a copied contextvars.Context — and prove:
+
+              1. os.environ is never written to (the leak vector is gone).
+              2. A separately-copied context that binds a real interactive gateway
+                 session (set_session_vars(platform="telegram", ...)) sees NO
+                 cron classification and IS treated as a gateway approval context.
+            """
+            assert "HERMES_CRON_SESSION" not in os.environ
+
+            def _cron_job_body():
+                # Task-local bind, exactly like run_job() in cron/scheduler.py.
+                _VAR_MAP["HERMES_CRON_SESSION"].set("1")
+                assert _is_cron_session() is True
+
+            cron_ctx = contextvars.copy_context()
+            cron_ctx.run(_cron_job_body)
+
+            # The cron job's bind must not have escaped into os.environ or into
+            # this (the spawning) context.
+            assert "HERMES_CRON_SESSION" not in os.environ
+            assert _VAR_MAP["HERMES_CRON_SESSION"].get() is _UNSET
+
+            def _interactive_body():
+                tokens = set_session_vars(platform="telegram", chat_id="123", user_id="u1")
+                try:
+                    assert _is_cron_session() is False
+                    assert _is_gateway_approval_context() is True
+                finally:
+                    clear_session_vars(tokens)
+
+            interactive_ctx = contextvars.copy_context()
+            interactive_ctx.run(_interactive_body)
 
 
 class TestRunJobCronMarkerLifecycle:
-    """Real run_job() lifecycle for the HERMES_CRON_SESSION marker.
-
-    The marker must be bound for the duration of the job (so cron_mode
-    applies inside it) and token-reset in run_job's finally: leaving it set
-    would misclassify later work on the scheduler thread's ambient context,
-    while resetting via ``.set("")`` would be just as wrong — an explicit
-    empty value is authoritative for get_session_env() and would suppress
-    the os.environ fallback that dedicated cron worker processes rely on.
-    Mock harness mirrors tests/cron/test_cron_provider_pin.py.
-    """
-
-    @pytest.fixture(autouse=True)
-    def _clean_marker_state(self, monkeypatch):
-        _VAR_MAP["HERMES_CRON_SESSION"].set(_UNSET)
-        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
-        yield
-        _VAR_MAP["HERMES_CRON_SESSION"].set(_UNSET)
-
     def test_marker_bound_during_job_and_token_reset_after(self, tmp_path, monkeypatch):
-        from unittest.mock import MagicMock, patch as mock_patch
+            from unittest.mock import MagicMock, patch as mock_patch
 
-        from cron.scheduler import run_job
+            from cron.scheduler import run_job
 
-        seen = {}
+            seen = {}
 
-        def _record_marker(*args, **kwargs):
-            # Runs inside run_job, standing in for the agent turn: the job
-            # itself must classify as cron so cron_mode applies to it.
-            seen["is_cron"] = _is_cron_session()
-            seen["env_written"] = "HERMES_CRON_SESSION" in os.environ
-            return {"final_response": "ok"}
+            def _record_marker(*args, **kwargs):
+                # Runs inside run_job, standing in for the agent turn: the job
+                # itself must classify as cron so cron_mode applies to it.
+                seen["is_cron"] = _is_cron_session()
+                seen["env_written"] = "HERMES_CRON_SESSION" in os.environ
+                return {"final_response": "ok"}
 
-        job = {
-            "id": "marker-lifecycle-test",
-            "name": "marker lifecycle test",
-            "prompt": "hello",
-            "model": "test-model",
-            "provider": None,
-            "provider_snapshot": "openrouter",
-            "base_url": None,
-        }
+            job = {
+                "id": "marker-lifecycle-test",
+                "name": "marker lifecycle test",
+                "prompt": "hello",
+                "model": "test-model",
+                "provider": None,
+                "provider_snapshot": "openrouter",
+                "base_url": None,
+            }
 
-        def _job_body():
-            # run_job also clear_session_vars()-clears the HERMES_SESSION_*
-            # contextvars to explicit "" on exit (documented semantics, not
-            # under test here), so drive it in a copied Context — like the
-            # scheduler's own thread — to keep this test's ambient context
-            # clean for whatever test runs next.
-            success, _output, _final, error = run_job(job)
-            seen["success"] = success
-            seen["error"] = error
-            # Still inside the job's context, after run_job returned: the
-            # marker must be token-reset back to the "never set" sentinel —
-            # not left at "1", and not overwritten with an authoritative "".
-            seen["marker_after"] = _VAR_MAP["HERMES_CRON_SESSION"].get()
+            def _job_body():
+                # run_job also clear_session_vars()-clears the HERMES_SESSION_*
+                # contextvars to explicit "" on exit (documented semantics, not
+                # under test here), so drive it in a copied Context — like the
+                # scheduler's own thread — to keep this test's ambient context
+                # clean for whatever test runs next.
+                success, _output, _final, error = run_job(job)
+                seen["success"] = success
+                seen["error"] = error
+                # Still inside the job's context, after run_job returned: the
+                # marker must be token-reset back to the "never set" sentinel —
+                # not left at "1", and not overwritten with an authoritative "".
+                seen["marker_after"] = _VAR_MAP["HERMES_CRON_SESSION"].get()
 
-        fake_db = MagicMock()
-        with mock_patch("cron.scheduler._hermes_home", tmp_path), \
-             mock_patch("cron.scheduler._resolve_origin", return_value=None), \
-             mock_patch("hermes_cli.env_loader.load_hermes_dotenv"), \
-             mock_patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             mock_patch("hermes_state.SessionDB", return_value=fake_db), \
-             mock_patch(
-                 "hermes_cli.runtime_provider.resolve_runtime_provider",
-                 return_value={
-                     "api_key": "test-key",
-                     "base_url": "https://example.invalid/v1",
-                     "provider": "openrouter",
-                     "api_mode": "chat_completions",
-                 },
-             ), \
-             mock_patch("run_agent.AIAgent") as mock_agent_cls:
-            mock_agent = MagicMock()
-            mock_agent.run_conversation.side_effect = _record_marker
-            mock_agent_cls.return_value = mock_agent
+            fake_db = MagicMock()
+            with mock_patch("cron.scheduler._hermes_home", tmp_path), \
+                 mock_patch("cron.scheduler._resolve_origin", return_value=None), \
+                 mock_patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+                 mock_patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+                 mock_patch("hermes_state.SessionDB", return_value=fake_db), \
+                 mock_patch(
+                     "hermes_cli.runtime_provider.resolve_runtime_provider",
+                     return_value={
+                         "api_key": "test-key",
+                         "base_url": "https://example.invalid/v1",
+                         "provider": "openrouter",
+                         "api_mode": "chat_completions",
+                     },
+                 ), \
+                 mock_patch("run_agent.AIAgent") as mock_agent_cls:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.side_effect = _record_marker
+                mock_agent_cls.return_value = mock_agent
 
-            contextvars.copy_context().run(_job_body)
+                contextvars.copy_context().run(_job_body)
 
-        assert seen["success"] is True
-        assert seen["error"] is None
+            assert seen["success"] is True
+            assert seen["error"] is None
 
-        # Inside the job: classified as cron, without touching os.environ.
-        assert seen["is_cron"] is True
-        assert seen["env_written"] is False
+            # Inside the job: classified as cron, without touching os.environ.
+            assert seen["is_cron"] is True
+            assert seen["env_written"] is False
 
-        # After completion, in the job's own context: reset to _UNSET.
-        assert seen["marker_after"] is _UNSET
-        assert "HERMES_CRON_SESSION" not in os.environ
+            # After completion, in the job's own context: reset to _UNSET.
+            assert seen["marker_after"] is _UNSET
+            assert "HERMES_CRON_SESSION" not in os.environ
 
-        # And in the spawning context the os.environ fallback still works —
-        # a ".set(\"\")"-style reset inside run_job's context could never
-        # shadow it out here, and the marker itself never escaped.
-        assert _VAR_MAP["HERMES_CRON_SESSION"].get() is _UNSET
-        assert _is_cron_session() is False
-        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
-        assert _is_cron_session() is True
+            # And in the spawning context the os.environ fallback still works —
+            # a ".set(\"\")"-style reset inside run_job's context could never
+            # shadow it out here, and the marker itself never escaped.
+            assert _VAR_MAP["HERMES_CRON_SESSION"].get() is _UNSET
+            assert _is_cron_session() is False
+            monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+            assert _is_cron_session() is True

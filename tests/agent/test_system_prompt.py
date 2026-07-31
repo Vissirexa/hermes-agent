@@ -1,9 +1,11 @@
 """Tests for agent/system_prompt.py — context-file cwd wiring."""
 
+from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from agent.system_prompt import build_system_prompt_parts
+from agent.system_prompt import build_system_prompt, build_system_prompt_parts
 
 
 def _make_agent(**overrides):
@@ -31,7 +33,10 @@ def _captured_context_cwd(agent):
     """The cwd build_system_prompt_parts hands to build_context_files_prompt."""
     captured = {}
 
-    def fake_context_files(cwd=None, skip_soul=False, context_length=None):
+    def fake_context_files(
+        cwd=None, skip_soul=False, context_length=None,
+        allow_install_tree_fallback=False,
+    ):
         captured["cwd"] = cwd
         return ""
 
@@ -67,6 +72,16 @@ def _stable_prompt(agent):
         return build_system_prompt_parts(agent)["stable"]
 
 
+def _prompt_parts(agent):
+    with (
+        patch("run_agent.load_soul_md", return_value=""),
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=""),
+    ):
+        return build_system_prompt_parts(agent)
+
+
 def _init_code_repo(path):
     """A git repo that actually holds code — the coding posture requires a source
     file (or manifest), not a bare ``.git`` (a prose/notes repo stays general)."""
@@ -81,9 +96,9 @@ class TestCodingContextBlock:
         _init_code_repo(tmp_path)
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         agent = _make_agent(valid_tool_names=["read_file"], platform="cli")
-        stable = _stable_prompt(agent)
-        assert "coding agent" in stable
-        assert "Workspace" in stable
+        parts = _prompt_parts(agent)
+        assert "coding agent" in parts["stable"]
+        assert "Workspace" in parts["context"]
 
     def test_absent_when_off(self, monkeypatch, tmp_path):
         _init_code_repo(tmp_path)
@@ -101,40 +116,80 @@ class TestCodingContextBlock:
         assert "coding agent" not in _stable_prompt(agent)
 
 
-class TestClarifyFirstSteer:
-    """Clarify-first steer: only injected when the clarify tool is actually
-    registered — naming an unavailable tool induces hallucinated calls."""
+def test_build_system_prompt_records_stable_prefix():
+    agent = _make_agent()
+    with (
+        patch("run_agent.load_soul_md", return_value=""),
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value="context"),
+    ):
+        prompt = build_system_prompt(agent)
 
-    def test_present_when_clarify_registered(self):
-        agent = _make_agent(valid_tool_names=["clarify"])
-        assert "call clarify" in _stable_prompt(agent)
-
-    def test_absent_when_clarify_not_registered(self):
-        agent = _make_agent(valid_tool_names=["read_file"])
-        assert "call clarify" not in _stable_prompt(agent)
-
-    def test_absent_with_no_tools(self):
-        agent = _make_agent(valid_tool_names=[])
-        assert "call clarify" not in _stable_prompt(agent)
+    assert prompt.startswith(agent._cached_system_prompt_static)
+    assert prompt[len(agent._cached_system_prompt_static):].startswith("\n\ncontext")
 
 
-class TestResearchReadOnlySteer:
-    """Research-is-read-only steer: on by default when tools are loaded,
-    off via config gate or when the agent has no tools (nothing to steer)."""
+def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
+    """The cache split must not reorder the stored coding prompt."""
+    import agent.system_prompt as system_prompt
 
-    def test_present_by_default_with_tools(self):
-        agent = _make_agent(valid_tool_names=["read_file"])
-        assert "Research tasks are read-only" in _stable_prompt(agent)
+    agent = _make_agent(
+        valid_tool_names=["read_file"],
+        _parallel_tool_call_guidance=False,
+        # Fork-local steers: disabled here for the same reason as the parallel
+        # guidance above — this test pins an exact stable-prompt composition.
+        _convergence_guidance=False,
+        _research_read_only_guidance=False,
+    )
+    monkeypatch.setattr(system_prompt, "DEFAULT_AGENT_IDENTITY", "IDENTITY")
+    monkeypatch.setattr(system_prompt, "HERMES_AGENT_HELP_GUIDANCE", "HELP")
+    monkeypatch.setattr(system_prompt, "STEER_CHANNEL_NOTE", "STEER")
+    # Fork-local web-fetch steer has no config gate (it keys off registered
+    # tools), so silence it here — this test pins ordering, not steer content.
+    monkeypatch.setattr(system_prompt, "build_web_fetch_guidance", lambda names: "")
+    monkeypatch.setattr(system_prompt, "get_hermes_home", lambda: Path("/hermes"))
 
-    def test_absent_when_gated_off(self):
-        agent = _make_agent(
-            valid_tool_names=["read_file"], _research_read_only_guidance=False
-        )
-        assert "Research tasks are read-only" not in _stable_prompt(agent)
+    expected_profile = (
+        "Active Hermes profile: default. Other profiles (if any) live "
+        "under /hermes/profiles/<name>/. Each profile has its own skills/, "
+        "plugins/, cron/, and memories/ that affect a different session than "
+        "this one. Do not modify another profile's skills/plugins/cron/memories "
+        "unless the user explicitly directs you to."
+    )
+    expected = "\n\n".join((
+        "IDENTITY",
+        "HELP",
+        "STEER",
+        "CODING_STABLE",
+        "WORKSPACE",
+        "Operator instructions (from config):\nOPERATOR",
+        expected_profile,
+        "SYSTEM_MESSAGE",
+        "CONTEXT_FILES",
+        "Conversation started: Friday, January 02, 2026",
+    ))
 
-    def test_absent_with_no_tools(self):
-        agent = _make_agent(valid_tool_names=[])
-        assert "Research tasks are read-only" not in _stable_prompt(agent)
+    with (
+        patch("run_agent.load_soul_md", return_value=""),
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value="CONTEXT_FILES"),
+        patch(
+            "agent.coding_context.coding_system_prompt_parts",
+            return_value=(
+                ["CODING_STABLE"],
+                ["WORKSPACE"],
+                ["Operator instructions (from config):\nOPERATOR"],
+            ),
+        ),
+        patch("agent.file_safety._resolve_active_profile_name", return_value="default"),
+        patch("hermes_time.now", return_value=datetime(2026, 1, 2)),
+    ):
+        prompt = build_system_prompt(agent, system_message="SYSTEM_MESSAGE")
+
+    assert prompt == expected
+    assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:4])
 
 
 class TestTelegramRichMessagesHint:
@@ -178,3 +233,29 @@ class TestTelegramRichMessagesHint:
             stable = _stable_prompt(agent)
         assert "Standard Markdown is automatically converted" in stable
         assert "lean into it" not in stable
+
+
+class TestClarifyFirstSteer:
+    def test_present_when_clarify_registered(self):
+            agent = _make_agent(valid_tool_names=["clarify"])
+            assert "call clarify" in _stable_prompt(agent)
+
+    def test_absent_when_clarify_not_registered(self):
+            agent = _make_agent(valid_tool_names=["read_file"])
+            assert "call clarify" not in _stable_prompt(agent)
+
+
+class TestResearchReadOnlySteer:
+    def test_absent_with_no_tools(self):
+            agent = _make_agent(valid_tool_names=[])
+            assert "Research tasks are read-only" not in _stable_prompt(agent)
+
+    def test_present_by_default_with_tools(self):
+            agent = _make_agent(valid_tool_names=["read_file"])
+            assert "Research tasks are read-only" in _stable_prompt(agent)
+
+    def test_absent_when_gated_off(self):
+            agent = _make_agent(
+                valid_tool_names=["read_file"], _research_read_only_guidance=False
+            )
+            assert "Research tasks are read-only" not in _stable_prompt(agent)
