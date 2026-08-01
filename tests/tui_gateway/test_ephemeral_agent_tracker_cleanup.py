@@ -15,6 +15,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import tools.file_tools as ft
+import tools.terminal_tool as tt
 from tui_gateway import server
 
 
@@ -45,7 +46,7 @@ def _make_touching_agent(seen: dict):
             with ft._patch_failure_lock:
                 ft._patch_failure_tracker[tid] = {"n": 1}
             with ft._file_ops_lock:
-                ft._last_known_cwd[tid] = "/x"
+                tt._session_cwd[tid] = "/x"
                 ft._file_ops_cache[tid] = {"op": 1}
             seen["tid"] = tid
             seen["present_during_run"] = tid in ft._read_tracker
@@ -60,7 +61,7 @@ def _make_touching_agent(seen: dict):
 def _assert_all_trackers_absent(tid: str):
     assert tid not in ft._read_tracker
     assert tid not in ft._patch_failure_tracker
-    assert tid not in ft._last_known_cwd
+    assert tid not in tt._session_cwd
     assert tid not in ft._file_ops_cache
 
 
