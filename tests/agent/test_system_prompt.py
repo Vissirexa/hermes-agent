@@ -284,10 +284,18 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     """The cache split must not reorder the stored coding prompt."""
     import agent.system_prompt as system_prompt
 
+    # This test asserts EXACT prompt equality, so every optional steer must be
+    # off. The fork adds three tool-aware blocks on top of upstream's; the two
+    # config-gated ones go off via the agent, and the web-fetch builder (which
+    # has no flag) is neutralized below. Empty parts are dropped by the
+    # stable-band join, so returning "" removes it cleanly.
     agent = _make_agent(
         valid_tool_names=["read_file"],
         _parallel_tool_call_guidance=False,
+        _convergence_guidance=False,
+        _research_read_only_guidance=False,
     )
+    monkeypatch.setattr(system_prompt, "build_web_fetch_guidance", lambda names: "")
     monkeypatch.setattr(system_prompt, "DEFAULT_AGENT_IDENTITY", "IDENTITY")
     monkeypatch.setattr(system_prompt, "HERMES_AGENT_HELP_GUIDANCE", "HELP")
     monkeypatch.setattr(system_prompt, "STEER_CHANNEL_NOTE", "STEER")
