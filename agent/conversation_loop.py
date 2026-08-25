@@ -2535,6 +2535,20 @@ def run_conversation(
         # last also keeps breakpoints off messages that the orphan sweep or
         # the thinking-only drop is about to remove or merge away.
         tools_for_api = agent.tools
+        # Guardrail-halt wrap-up: this one call offers no tools so the model
+        # writes a real summary of what it observed instead of resuming the
+        # halted loop. Consumed here so the following call re-arms tools.
+        #
+        # This is the only place the toolset may narrow mid-conversation, and
+        # it is deliberately the LAST call of the turn: an empty list makes
+        # the transports omit ``tools`` entirely (they gate on truthiness), so
+        # the request prefix diverges for this one call and the next turn --
+        # which sends the full toolset again -- re-matches the prefix cached
+        # before the halt. Nothing mutates ``agent.tools``, so no later turn
+        # sees a changed toolset.
+        if getattr(agent, "_toolguard_suppress_tools_next_call", False):
+            agent._toolguard_suppress_tools_next_call = False
+            tools_for_api = []
         if agent._use_prompt_caching and agent.provider != "moa":
             _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
             _initial_cache_plan = build_prompt_cache_plan(
@@ -7479,6 +7493,30 @@ def run_conversation(
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
+                    if not getattr(agent, "_toolguard_wrapup_used", False):
+                        # Give the model one tool-free call to write the final
+                        # answer before ending the turn. The canned response
+                        # below discards everything the model actually
+                        # observed -- partial results, the concrete blocker --
+                        # and reads as a crash to the user. Suppressing tools
+                        # for exactly one call bounds the loop just as hard.
+                        #
+                        # No synthetic user message is injected: the guardrail
+                        # explanation already reached the model on the tool
+                        # RESULT (append_toolguard_guidance), so the wrap-up
+                        # call continues the normal
+                        # assistant -> tool -> assistant alternation.
+                        # A second halt after the wrap-up falls through to the
+                        # canned response.
+                        agent._toolguard_wrapup_used = True
+                        agent._toolguard_last_halt_decision = decision
+                        agent._tool_guardrail_halt_decision = None
+                        agent._toolguard_suppress_tools_next_call = True
+                        agent._emit_status(
+                            f"⚠️ Tool guardrail halted {decision.tool_name}: "
+                            f"{decision.code} — requesting a final summary"
+                        )
+                        continue
                     _turn_exit_reason = "guardrail_halt"
                     final_response = agent._toolguard_controlled_halt_response(decision)
                     agent._emit_status(
