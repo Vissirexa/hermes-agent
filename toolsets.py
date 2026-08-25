@@ -53,7 +53,7 @@ _HERMES_CORE_TOOLS = [
     # Browser automation
     "browser_navigate", "browser_snapshot", "browser_click",
     "browser_type", "browser_scroll", "browser_back",
-    "browser_press", "browser_get_images",
+    "browser_press", "browser_wait", "browser_get_images",
     "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
     # replaces other tools when browser.backend is "browser-use"
     "browser_exec",
@@ -207,7 +207,7 @@ TOOLSETS = {
         "tools": [
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
-            "browser_press", "browser_get_images",
+            "browser_press", "browser_wait", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp",
             "browser_dialog", "browser_exec", "web_search"
         ],
@@ -415,7 +415,7 @@ TOOLSETS = {
             "skills_list", "skill_view", "skill_manage",
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
-            "browser_press", "browser_get_images",
+            "browser_press", "browser_wait", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
             "browser_exec",
             "todo", "memory",
@@ -448,7 +448,7 @@ TOOLSETS = {
             "skills_list", "skill_view", "skill_manage",
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
-            "browser_press", "browser_get_images",
+            "browser_press", "browser_wait", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
             "browser_exec",
             "todo", "memory",
@@ -478,7 +478,7 @@ TOOLSETS = {
             # Browser automation
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
-            "browser_press", "browser_get_images",
+            "browser_press", "browser_wait", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
             "browser_exec",
             # Planning & memory

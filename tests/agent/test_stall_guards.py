@@ -137,8 +137,17 @@ def _fake_agent(stall_guards=True):
         _tool_guardrails=ToolCallGuardrailController(),
         _stall_guards=stall_guards,
         _tool_guardrail_halt_decision=None,
+        # _append_guardrail_observation routes warn/halt decisions through
+        # _toolguard_wait_hint, which reads the registered tool names. Empty
+        # here: these tests exercise web_search, so the browser_wait hint is
+        # never in play (it has its own coverage in
+        # tests/run_agent/test_tool_call_guardrail_runtime.py).
+        valid_tool_names=set(),
     )
     agent._stall_guards_enabled = lambda: AIAgent._stall_guards_enabled(agent)
+    agent._toolguard_wait_hint = (
+        lambda decision: AIAgent._toolguard_wait_hint(agent, decision)
+    )
     agent._set_tool_guardrail_halt = (
         lambda decision: AIAgent._set_tool_guardrail_halt(agent, decision)
     )
